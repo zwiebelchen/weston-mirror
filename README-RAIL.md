@@ -15,7 +15,10 @@ einer Anwendung erscheint beim Client als eigenes lokales Fenster.
 | Kompiliert unter Debian 13 (FreeRDP 3) | ja |
 | Weston startet mit RDP-Backend + rdprail-shell | ja |
 | TLS mit automatisch erzeugtem Zertifikat | ja |
-| RemoteApp im Client sichtbar | in Arbeit |
+| RemoteApp mit `mstsc` (Fenster, Tastatur inkl. Umlaute, Maus) | ja, getestet mit Firefox und weston-terminal |
+| Mehrere Instanzen über eine Verbindung | ja (mstsc nutzt die offene Verbindung) |
+| Abmelden, wenn die letzte App geschlossen wird | ja, nach 5 s |
+| RemoteApp mit `xfreerdp3` (Linux-Client) | startet, Fensterinhalt bleibt schwarz (Client-Problem) |
 | Mikrofon-Weiterleitung (audin) | unter FreeRDP 3 deaktiviert |
 | App-Liste an den Client publizieren (`rdpapplist`) | nicht verfügbar (Microsoft-eigener Kanal) |
 | Authentifizierung | **fehlt** (siehe Sicherheit) |
@@ -79,6 +82,15 @@ weston --backend=rdp-backend.so --shell=rdprail-shell.so --port=3389 \
        --logger-scopes=log,rdp-backend,rdprail-shell
 ```
 
+`XDG_RUNTIME_DIR` muss auf ein existierendes Verzeichnis zeigen. Fehlt
+`/run/user/<uid>` (z. B. im LXC-Container ohne Login-Session):
+`sudo loginctl enable-linger $USER` oder das Verzeichnis von Hand anlegen
+(Besitzer = User, Rechte 700).
+
+Eine UTF-8-Locale setzen (`export LANG=de_DE.UTF-8` bzw. `C.UTF-8`), sonst
+zeigen Terminal-Anwendungen keine Umlaute an. Grafische Anwendungen wie
+Firefox sind davon nicht betroffen.
+
 Ohne `--rdp-tls-cert`/`--rdp-tls-key` erzeugt Weston beim Start ein
 selbstsigniertes Zertifikat. Mehr Debug-Ausgaben: `WESTON_RDP_DEBUG_LEVEL=4`.
 
@@ -88,13 +100,19 @@ Client (Linux):
 xfreerdp3 /v:SERVER:3389 /app:program:/usr/bin/weston-terminal /cert:ignore
 ```
 
-Client (Windows): `.rdp`-Datei mit
+Client (Windows, empfohlen): `.rdp`-Datei mit
 
 ```
 full address:s:SERVER:3389
 remoteapplicationmode:i:1
-remoteapplicationprogram:s:/usr/bin/weston-terminal
+remoteapplicationprogram:s:/usr/bin/firefox
+remoteapplicationname:s:Firefox
+enablecredsspsupport:i:0
+authentication level:i:0
+prompt for credentials:i:0
 ```
+
+`enablecredsspsupport:i:0` ist nötig, weil der Server (noch) kein NLA kann.
 
 ## Sicherheit – bitte lesen
 
