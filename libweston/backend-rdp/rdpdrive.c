@@ -120,6 +120,15 @@ struct attr_entry {
 
 struct rdp_drives;
 
+/* a file opened through FUSE; fi->fh points to it */
+struct open_file {
+	struct wl_list link;		/* rdp_drives::open_files */
+	UINT32 dev;
+	UINT32 file_id;
+	char *path;			/* FUSE path */
+	bool detached;			/* client handle already closed */
+};
+
 /* one outstanding rdpdr request; the FUSE thread waits on it */
 struct drive_wait {
 	struct wl_list link;		/* rdp_drives::pending */
@@ -147,6 +156,7 @@ struct rdp_drives {
 	pthread_mutex_t lock;		/* drives[], pending, cache, shutdown */
 	struct rdp_drive drives[MAX_DRIVES];
 	struct wl_list pending;
+	struct wl_list open_files;
 	bool shutdown;
 
 	struct attr_entry *cache[ATTR_CACHE_BUCKETS];
@@ -648,6 +658,59 @@ DRV_SIMPLE(drv_rename, d->rdpdr->DriveRenameFile(d->rdpdr, w, dev, a, b))
 		_rc;							\
 	})
 
+/* ---- open file registry ---- */
+
+static void
+of_attach(struct rdp_drives *d, struct fuse_file_info *fi, UINT32 dev,
+	  UINT32 file_id, const char *path)
+{
+	struct open_file *of = xzalloc(sizeof *of);
+
+	of->dev = dev;
+	of->file_id = file_id;
+	of->path = xstrdup(path);
+	pthread_mutex_lock(&d->lock);
+	wl_list_insert(&d->open_files, &of->link);
+	pthread_mutex_unlock(&d->lock);
+	fi->fh = (uint64_t)(uintptr_t)of;
+}
+
+static struct open_file *
+of_get(struct fuse_file_info *fi)
+{
+	return (struct open_file *)(uintptr_t)fi->fh;
+}
+
+/*
+ * Close the client handles we hold on a path before renaming over it or
+ * deleting it. POSIX allows both on open files and GIO relies on it (it
+ * renames the temporary file while it is still open and may keep the
+ * original open); Windows refuses with a sharing violation, whatever
+ * share mode the handles were opened with. The FUSE handles stay valid
+ * but are detached: releasing them is a no-op, I/O fails with EIO.
+ */
+static void
+detach_path(struct rdp_drives *d, const char *path)
+{
+	struct open_file *of;
+	struct { UINT32 dev, file_id; } todo[32];
+	int n = 0, i;
+
+	pthread_mutex_lock(&d->lock);
+	wl_list_for_each(of, &d->open_files, link) {
+		if (!of->detached && strcasecmp(of->path, path) == 0 && n < 32) {
+			of->detached = true;
+			todo[n].dev = of->dev;
+			todo[n].file_id = of->file_id;
+			n++;
+		}
+	}
+	pthread_mutex_unlock(&d->lock);
+
+	for (i = 0; i < n; i++)
+		drv_close(d, todo[i].dev, todo[i].file_id);
+}
+
 /* ------------------------------------------------------------------ */
 /* FUSE operations                                                     */
 /* ------------------------------------------------------------------ */
@@ -805,7 +868,7 @@ op_open(const char *path, struct fuse_file_info *fi)
 		return rc;
 	if (fi->flags & O_TRUNC)
 		cache_clear(d);
-	fi->fh = ((uint64_t)dev << 32) | file_id;
+	of_attach(d, fi, dev, file_id, path);
 	return 0;
 }
 
@@ -834,7 +897,7 @@ op_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 	if (rc < 0)
 		return rc;
 	cache_clear(d);
-	fi->fh = ((uint64_t)dev << 32) | file_id;
+	of_attach(d, fi, dev, file_id, path);
 	return 0;
 }
 
@@ -844,10 +907,13 @@ op_read(const char *path, char *buf, size_t size, off_t offset,
 {
 	struct rdp_drives *d = get_drives();
 	struct drive_wait *w;
-	UINT32 dev = fi->fh >> 32, file_id = fi->fh & 0xffffffff;
+	struct open_file *of = of_get(fi);
+	UINT32 dev = of->dev, file_id = of->file_id;
 	int rc;
 
 	(void)path;
+	if (of->detached)
+		return -EIO;
 	if (offset < 0 || offset > UINT32_MAX)
 		return -EFBIG;	/* rdpdr offsets are 32 bit in FreeRDP's API */
 
@@ -878,10 +944,13 @@ op_write(const char *path, const char *buf, size_t size, off_t offset,
 {
 	struct rdp_drives *d = get_drives();
 	struct drive_wait *w;
-	UINT32 dev = fi->fh >> 32, file_id = fi->fh & 0xffffffff;
+	struct open_file *of = of_get(fi);
+	UINT32 dev = of->dev, file_id = of->file_id;
 	int rc;
 
 	(void)path;
+	if (of->detached)
+		return -EIO;
 	if (offset < 0 || offset + (off_t)size > UINT32_MAX)
 		return -EFBIG;
 
@@ -908,8 +977,18 @@ op_release(const char *path, struct fuse_file_info *fi)
 {
 	struct rdp_drives *d = get_drives();
 
+	struct open_file *of = of_get(fi);
+	bool detached;
+
 	(void)path;
-	drv_close(d, fi->fh >> 32, fi->fh & 0xffffffff);
+	pthread_mutex_lock(&d->lock);
+	wl_list_remove(&of->link);
+	detached = of->detached;
+	pthread_mutex_unlock(&d->lock);
+	if (!detached)
+		drv_close(d, of->dev, of->file_id);
+	free(of->path);
+	free(of);
 	return 0;
 }
 
@@ -959,6 +1038,7 @@ op_unlink(const char *path)
 	RESOLVE_OR(-EACCES);
 	int rc;
 
+	detach_path(d, path);
 	rc = RETRY_BUSY(drv_unlink(d, dev, rel, NULL));
 	cache_clear(d);
 	return rc;
@@ -981,6 +1061,8 @@ op_rename(const char *path, const char *to, unsigned int flags)
 	if (dev_to != dev)
 		return -EXDEV;
 
+	detach_path(d, path);
+	detach_path(d, to);
 	rc = RETRY_BUSY(drv_rename(d, dev, rel, rel_to));
 	/* POSIX rename replaces an existing target, Windows does not */
 	if (rc == -EEXIST && !(flags & RENAME_NOREPLACE)) {
@@ -1850,6 +1932,7 @@ rdp_drives_init(RdpPeerContext *peer_ctx)
 	d->rdpdr = rdpdr;
 	pthread_mutex_init(&d->lock, NULL);
 	wl_list_init(&d->pending);
+	wl_list_init(&d->open_files);
 
 	rdpdr->data = d;
 	rdpdr->rdpcontext = &peer_ctx->_p;
@@ -1929,6 +2012,15 @@ rdp_drives_destroy(RdpPeerContext *peer_ctx)
 	 * completion references of requests that never finished are leaked
 	 * deliberately (a few bytes per lost request at session end) */
 
+	{
+		struct open_file *of, *ot;
+
+		wl_list_for_each_safe(of, ot, &d->open_files, link) {
+			wl_list_remove(&of->link);
+			free(of->path);
+			free(of);
+		}
+	}
 	cache_clear(d);
 	pthread_mutex_destroy(&d->lock);
 	free(d->mount_dir);
