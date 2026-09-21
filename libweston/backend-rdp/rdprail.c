@@ -3139,9 +3139,13 @@ rdp_rail_sync_window_zorder(struct weston_compositor *compositor)
 		monitored_desktop_order.numWindowIds = iCurrent;
 		monitored_desktop_order.windowIds = windowIdArray;
 
+		/* FreeRDP 3 batches window orders; without a paint bracket they are
+		 * never flushed to the client. */
+		client->context->update->BeginPaint(client->context);
 		client->context->update->window->MonitoredDesktop(client->context,
 								  &window_order_info,
 								  &monitored_desktop_order);
+		client->context->update->EndPaint(client->context);
 		client->DrainOutputBuffer(client);
 	}
 
@@ -3647,7 +3651,10 @@ rdp_rail_sync_window_status(freerdp_peer *client)
 		client->DrainOutputBuffer(client);
 	}
 
-	{
+	/* MS-RDPERP: the Z-order sync PDU may only be sent to clients that
+	 * announced TS_RAIL_CLIENTSTATUS_ZORDER_SYNC. mstsc does, FreeRDP does
+	 * not, and FreeRDP drops the connection when it receives one anyway. */
+	if (peer_ctx->clientStatusFlags & TS_RAIL_CLIENTSTATUS_ZORDER_SYNC) {
 		RAIL_ZORDER_SYNC zOrderSync = {
 			.windowIdMarker = RDP_RAIL_MARKER_WINDOW_ID,
 		};
@@ -3664,9 +3671,13 @@ rdp_rail_sync_window_status(freerdp_peer *client)
 		};
 		MONITORED_DESKTOP_ORDER monitored_desktop_order = {};
 
+		/* FreeRDP 3 batches window orders; without a paint bracket they are
+		 * never flushed to the client. */
+		update->BeginPaint(update->context);
 		update->window->MonitoredDesktop(update->context,
 						 &window_order_info,
 						 &monitored_desktop_order);
+		update->EndPaint(update->context);
 		client->DrainOutputBuffer(client);
 	}
 
@@ -3685,9 +3696,13 @@ rdp_rail_sync_window_status(freerdp_peer *client)
 			.windowIds = (UINT *)&windowsIdArray,
 		};
 
+		/* FreeRDP 3 batches window orders; without a paint bracket they are
+		 * never flushed to the client. */
+		update->BeginPaint(update->context);
 		update->window->MonitoredDesktop(update->context,
 						 &window_order_info,
 						 &monitored_desktop_order);
+		update->EndPaint(update->context);
 		client->DrainOutputBuffer(client);
 	}
 
@@ -3699,9 +3714,13 @@ rdp_rail_sync_window_status(freerdp_peer *client)
 		};
 		MONITORED_DESKTOP_ORDER monitored_desktop_order = {};
 
+		/* FreeRDP 3 batches window orders; without a paint bracket they are
+		 * never flushed to the client. */
+		update->BeginPaint(update->context);
 		update->window->MonitoredDesktop(update->context,
 						 &window_order_info,
 						 &monitored_desktop_order);
+		update->EndPaint(update->context);
 		client->DrainOutputBuffer(client);
 	}
 
@@ -4063,6 +4082,19 @@ rdp_drdynvc_init(freerdp_peer *client)
 	DrdynvcServerContext *vc_ctx;
 
 	assert_compositor_thread(peer_ctx->rdpBackend);
+
+#if FREERDP_VERSION_MAJOR >= 3
+	/*
+	 * FreeRDP 3: the virtual channel manager drives drdynvc itself.
+	 * Starting the separate drdynvc server addin as well lets that addin's
+	 * thread swallow the client's CAPS response, and the manager never
+	 * reaches DRDYNVC_STATE_READY. Just make sure the CAPS request went out;
+	 * the caller waits for READY asynchronously (rdp_client_activity()).
+	 */
+	(void)vc_ctx;
+	client->activated = TRUE;
+	return WTSVirtualChannelManagerOpen(peer_ctx->vcm) ? true : false;
+#endif
 
 	/* Open Dynamic virtual channel */
 	vc_ctx = drdynvc_server_context_new(peer_ctx->vcm);

@@ -279,6 +279,11 @@ struct rdp_peer_context {
 
 	// Application List support
 	BOOL isAppListEnabled;
+
+	/* FreeRDP 3: activation continues once the dynamic virtual channel
+	 * is ready, see rdp_client_activity() */
+	BOOL activation_pending;
+	time_t activation_deadline;
 };
 
 typedef struct rdp_peer_context RdpPeerContext;
