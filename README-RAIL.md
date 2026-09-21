@@ -249,7 +249,7 @@ remoteapplicationname:s:Firefox
 username:s:BENUTZER
 enablecredsspsupport:i:0
 prompt for credentials:i:0
-authentication level:i:2
+authentication level:i:0
 disableconnectionsharing:i:1
 drivestoredirect:s:*
 redirectprinters:i:1
@@ -265,6 +265,12 @@ cmdkey /generic:TERMSRV/SERVERNAME /user:BENUTZER /pass:PASSWORT
 
 `SERVERNAME` genau so, wie er in `full address` steht. Root-Anmeldungen sind
 gesperrt (`--allow-root`).
+
+`authentication level:i:0`: Die Verbindung ist per TLS verschlüsselt, mstsc
+prüft aber nicht, ob das Serverzertifikat vertrauenswürdig ist. Für den
+Betrieb besser ein vertrauenswürdiges Zertifikat einrichten (siehe unten) und
+`authentication level:i:2` setzen – mit `2` bricht mstsc bei einem
+unbekannten Zertifikat ab.
 
 ### Zertifikat
 
