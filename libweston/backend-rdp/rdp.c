@@ -740,6 +740,8 @@ rdp_peer_context_new(freerdp_peer* client, RdpPeerContext* context)
 	context->loop_task_event_source_fd = -1;
 	context->loop_task_event_source = NULL;
 	wl_list_init(&context->loop_task_list);
+	wl_list_init(&context->exec_clients);
+	context->logoff_timer = NULL;
 
 	context->rfx_context = rfx_context_new(TRUE);
 	if (!context->rfx_context)
