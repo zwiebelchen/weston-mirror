@@ -53,6 +53,10 @@
 #endif
 
 #if FREERDP_VERSION_MAJOR >= 3
+/* MS-RDPERP 2.2.1.1.2 wndSupportLevel; FreeRDP keeps these in a private header */
+#ifndef WINDOW_LEVEL_SUPPORTED_EX
+#define WINDOW_LEVEL_SUPPORTED_EX 0x00000002
+#endif
 #include <freerdp/crypto/certificate.h>
 #include <freerdp/crypto/privatekey.h>
 #endif
@@ -736,6 +740,8 @@ rdp_peer_context_new(freerdp_peer* client, RdpPeerContext* context)
 	context->loop_task_event_source_fd = -1;
 	context->loop_task_event_source = NULL;
 	wl_list_init(&context->loop_task_list);
+	wl_list_init(&context->exec_clients);
+	context->logoff_timer = NULL;
 
 	context->rfx_context = rfx_context_new(TRUE);
 	if (!context->rfx_context)
@@ -838,6 +844,9 @@ rdp_peer_context_free(freerdp_peer* client, RdpPeerContext* context)
 	free(context->rfx_rects);
 }
 
+static BOOL xf_peer_activate_finish(freerdp_peer *client);
+static void xf_peer_activate_cleanup(freerdp_peer *client);
+
 static int
 rdp_client_activity(int fd, uint32_t mask, void *data)
 {
@@ -852,10 +861,34 @@ rdp_client_activity(int fd, uint32_t mask, void *data)
 
 	if (peerCtx && peerCtx->vcm)
 	{
+#if FREERDP_VERSION_MAJOR >= 3
+		/*
+		 * The plain variant auto-opens drdynvc, i.e. sends the CAPS request,
+		 * on the very first call - long before the client is activated and
+		 * able to process it. The request gets lost, the channel manager is
+		 * stuck in DRDYNVC_STATE_INITIALIZED and no dynamic channel ever
+		 * opens. Only auto-open once the peer is activated.
+		 */
+		if (!WTSVirtualChannelManagerCheckFileDescriptorEx(peerCtx->vcm, client->activated)) {
+#else
 		if (!WTSVirtualChannelManagerCheckFileDescriptor(peerCtx->vcm)) {
+#endif
 			rdp_debug_error(rdpBackend, "failed to check FreeRDP WTS VC file descriptor for %p\n", client);
 			goto out_clean;
         	}
+	}
+
+	if (peerCtx && peerCtx->activation_pending) {
+		if (WTSVirtualChannelManagerGetDrdynvcState(peerCtx->vcm) == DRDYNVC_STATE_READY) {
+			if (!xf_peer_activate_finish(client)) {
+				rdp_debug_error(rdpBackend, "deferred activation failed for %p\n", client);
+				goto out_clean;
+			}
+		} else if (time(NULL) > peerCtx->activation_deadline) {
+			rdp_debug_error(rdpBackend, "drdynvc not ready in time, closing %p\n", client);
+			xf_peer_activate_cleanup(client);
+			goto out_clean;
+		}
 	}
 
 	return 0;
@@ -1065,8 +1098,32 @@ convert_rdp_keyboard_to_xkb_rule_names(
 		xkbRuleNames->model, xkbRuleNames->layout, xkbRuleNames->variant, xkbRuleNames->options);
 }
 
+/* Undo what a (partial) activation set up. */
+static void
+xf_peer_activate_cleanup(freerdp_peer *client)
+{
+	RdpPeerContext *peerCtx = (RdpPeerContext *)client->context;
+	struct rdp_backend *b = peerCtx->rdpBackend;
+	rdpSettings *settings = client->context->settings;
+
+	rdp_clipboard_destroy(peerCtx);
+	if (settings->AudioPlayback && peerCtx->audio_out_private) {
+		b->audio_out_teardown(peerCtx->audio_out_private);
+		peerCtx->audio_out_private = NULL;
+	}
+	if (settings->AudioCapture && peerCtx->audio_in_private) {
+		b->audio_in_teardown(peerCtx->audio_in_private);
+		peerCtx->audio_in_private = NULL;
+	}
+	rdp_rail_peer_context_free(client, peerCtx);
+	rdp_drdynvc_destroy(peerCtx);
+
+}
+
+/* Second half of the activation: everything that needs the dynamic
+ * virtual channel to be READY (RAIL, audio) and the seat/output setup. */
 static BOOL
-xf_peer_activate(freerdp_peer* client)
+xf_peer_activate_finish(freerdp_peer* client)
 {
 	RdpPeerContext *peerCtx;
 	struct rdp_backend *b;
@@ -1087,61 +1144,12 @@ xf_peer_activate(freerdp_peer* client)
 	peersItem = &peerCtx->item;
 	settings = client->context->settings;
 
-	if (!settings->SurfaceCommandsEnabled) {
-		rdp_debug_error(b, "client doesn't support required SurfaceCommands\n");
-		return FALSE;
-	}
-
-	if (b->force_no_compression && settings->CompressionEnabled) {
-		rdp_debug_error(b, "Forcing compression off\n");
-		settings->CompressionEnabled = FALSE;
-	}
-
-	/* in RAIL mode, only one peer per backend can be activated */
-	if (settings->RemoteApplicationMode) {
-		if (b->rdp_peer != client) {
-			rdp_debug_error(b, "Another RAIL connection active, only one connection is allowed.\n");
-			return FALSE;
-		}
-
-		if (!settings->HiDefRemoteApp) {
-			/* HiDef is required for RAIL mode. Cookie-cutter window remoting is not supported. */
-			rdp_debug_error(b, "HiDef-RAIL is required for RAIL.\n");
-			return FALSE;
-		}
-
-		/* in HiDef RAIL mode, RAIL-shell must be used */
-		if (b->rdprail_shell_api == NULL) {
-			rdp_debug_error(b, "HiDef-RAIL is requested from client, but RAIL-shell is not used\n");
-			return FALSE;
-		}
-
-		/* do not wake up compositor yet, since in RAIL mode, there is no
-		   need to paint 'desktop', thus defer until window is created */
-	} else {
-		/* update RDP connection, wake up compositor to repaint 'desktop' */
-		weston_compositor_wake(b->compositor);
-		weston_compositor_damage_all(b->compositor);
-	}
-
-	/* override settings by env variables */
-	settings->RedirectClipboard = b->redirect_clipboard;
-	settings->AudioPlayback = b->audio_out_setup && b->audio_out_teardown;
-	settings->AudioCapture = b->audio_in_setup && b->audio_in_teardown;
+	peerCtx->activation_pending = FALSE;
 
 	if (settings->RemoteApplicationMode ||
 		settings->RedirectClipboard ||
 		settings->AudioPlayback ||
 		settings->AudioCapture) {
-
-		if (!peerCtx->vcm) {
-			rdp_debug_error(b, "Virtual channel is required for RAIL, clipboard, audio playback/capture\n");
-			goto error_exit;
-		}
-
-		/* RAIL, clipboard, Audio playback/capture requires dynamic virtual channel */
-		if (!rdp_drdynvc_init(client))
-			goto error_exit;
 
 		if (settings->RemoteApplicationMode)
 			if (!rdp_rail_peer_activate(client))
@@ -1269,19 +1277,97 @@ xf_peer_activate(freerdp_peer* client)
 	return TRUE;
 
 error_exit:
+	xf_peer_activate_cleanup(client);
+	return FALSE;
+}
 
-	rdp_clipboard_destroy(peerCtx);
-	if (settings->AudioPlayback && peerCtx->audio_out_private) {
-		b->audio_out_teardown(peerCtx->audio_out_private);
-		peerCtx->audio_out_private = NULL;
-	}
-	if (settings->AudioCapture && peerCtx->audio_in_private) {
-		b->audio_in_teardown(peerCtx->audio_in_private);
-		peerCtx->audio_in_private = NULL;
-	}
-	rdp_rail_peer_context_free(client, peerCtx);
-	rdp_drdynvc_destroy(peerCtx);
+static BOOL
+xf_peer_activate(freerdp_peer* client)
+{
+	RdpPeerContext *peerCtx;
+	struct rdp_backend *b;
+	rdpSettings *settings;
 
+	peerCtx = (RdpPeerContext *)client->context;
+	b = peerCtx->rdpBackend;
+	settings = client->context->settings;
+
+	if (!settings->SurfaceCommandsEnabled) {
+		rdp_debug_error(b, "client doesn't support required SurfaceCommands\n");
+		return FALSE;
+	}
+
+	if (b->force_no_compression && settings->CompressionEnabled) {
+		rdp_debug_error(b, "Forcing compression off\n");
+		settings->CompressionEnabled = FALSE;
+	}
+
+	/* in RAIL mode, only one peer per backend can be activated */
+	if (settings->RemoteApplicationMode) {
+		if (b->rdp_peer != client) {
+			rdp_debug_error(b, "Another RAIL connection active, only one connection is allowed.\n");
+			return FALSE;
+		}
+
+		if (!settings->HiDefRemoteApp) {
+			/* HiDef is required for RAIL mode. Cookie-cutter window remoting is not supported. */
+			rdp_debug_error(b, "HiDef-RAIL is required for RAIL.\n");
+			return FALSE;
+		}
+
+		/* in HiDef RAIL mode, RAIL-shell must be used */
+		if (b->rdprail_shell_api == NULL) {
+			rdp_debug_error(b, "HiDef-RAIL is requested from client, but RAIL-shell is not used\n");
+			return FALSE;
+		}
+
+		/* do not wake up compositor yet, since in RAIL mode, there is no
+		   need to paint 'desktop', thus defer until window is created */
+	} else {
+		/* update RDP connection, wake up compositor to repaint 'desktop' */
+		weston_compositor_wake(b->compositor);
+		weston_compositor_damage_all(b->compositor);
+	}
+
+	/* override settings by env variables */
+	settings->RedirectClipboard = b->redirect_clipboard;
+	settings->AudioPlayback = b->audio_out_setup && b->audio_out_teardown;
+	settings->AudioCapture = b->audio_in_setup && b->audio_in_teardown;
+
+	if (settings->RemoteApplicationMode ||
+		settings->RedirectClipboard ||
+		settings->AudioPlayback ||
+		settings->AudioCapture) {
+
+		if (!peerCtx->vcm) {
+			rdp_debug_error(b, "Virtual channel is required for RAIL, clipboard, audio playback/capture\n");
+			goto error_exit;
+		}
+
+		/* RAIL, clipboard, Audio playback/capture requires dynamic virtual channel */
+		if (!rdp_drdynvc_init(client))
+			goto error_exit;
+
+#if FREERDP_VERSION_MAJOR >= 3
+		/*
+		 * This callback runs inside FreeRDP's transport receive path, so
+		 * the client's drdynvc CAPS response cannot be read from here.
+		 * Return now and finish the activation from rdp_client_activity()
+		 * as soon as the channel manager reports DRDYNVC_STATE_READY.
+		 */
+		if (WTSVirtualChannelManagerGetDrdynvcState(peerCtx->vcm) != DRDYNVC_STATE_READY) {
+			peerCtx->activation_pending = TRUE;
+			peerCtx->activation_deadline = time(NULL) + 30;
+			rdp_debug(b, "activation deferred until drdynvc is ready\n");
+			return TRUE;
+		}
+#endif
+	}
+
+	return xf_peer_activate_finish(client);
+
+error_exit:
+	xf_peer_activate_cleanup(client);
 	return FALSE;
 }
 
@@ -1966,6 +2052,18 @@ rdp_peer_init(freerdp_peer *client, struct rdp_backend *b)
 		RAIL_LEVEL_LANGUAGE_IME_SYNC_SUPPORTED |
 		RAIL_LEVEL_SERVER_TO_CLIENT_IME_SYNC_SUPPORTED |
 		RAIL_LEVEL_HANDSHAKE_EX_SUPPORTED;
+#if FREERDP_VERSION_MAJOR >= 3
+	/*
+	 * Window List capability set (MS-RDPERP 2.2.1.1.2). The client adopts the
+	 * level the server announces here, and FreeRDP 3 clients reject every
+	 * window order (incl. the monitored desktop ARC_BEGAN/ARC_COMPLETED that
+	 * triggers the app launch) unless it is at least WINDOW_LEVEL_SUPPORTED.
+	 * FreeRDP 2 defaulted to these values, FreeRDP 3 does not.
+	 */
+	settings->RemoteWndSupportLevel = WINDOW_LEVEL_SUPPORTED_EX;
+	settings->RemoteAppNumIconCaches = 3;
+	settings->RemoteAppNumIconCacheEntries = 12;
+#endif
 	settings->SupportGraphicsPipeline = TRUE;
 	settings->SupportMonitorLayoutPdu = TRUE;
 	settings->RedirectClipboard = TRUE;

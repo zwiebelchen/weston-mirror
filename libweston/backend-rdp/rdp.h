@@ -247,8 +247,11 @@ struct rdp_peer_context {
 	uint32_t currentFrameId;
 	uint32_t acknowledgedFrameId;
 	bool isAcknowledgedSuspended;
-	struct wl_client *clientExec;
-	struct wl_listener clientExec_destroy_listener;
+	/* programs started on behalf of the client (RAIL exec orders);
+	 * several instances may run at the same time */
+	struct wl_list exec_clients;
+	/* disconnects the session once no remote application is left */
+	struct wl_event_source *logoff_timer;
 	struct weston_surface *cursorSurface;
 
 	// list of outstanding event_source sent from FreeRDP thread to display loop.
@@ -279,6 +282,11 @@ struct rdp_peer_context {
 
 	// Application List support
 	BOOL isAppListEnabled;
+
+	/* FreeRDP 3: activation continues once the dynamic virtual channel
+	 * is ready, see rdp_client_activity() */
+	BOOL activation_pending;
+	time_t activation_deadline;
 };
 
 typedef struct rdp_peer_context RdpPeerContext;
