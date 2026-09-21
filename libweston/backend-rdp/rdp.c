@@ -1708,6 +1708,19 @@ xf_input_keyboard_event(rdpInput *input, UINT16 flags, RDP_KBD_CODE_TYPE code)
 	if (!(peerContext->item.flags & RDP_PEER_ACTIVATED))
 		return TRUE;
 
+#if FREERDP_VERSION_MAJOR >= 3
+	/*
+	 * FreeRDP 3 passes the keyboard flags as sent on the wire: a key press
+	 * carries no KBD_FLAGS_DOWN (that flag means "was already down", i.e.
+	 * autorepeat). FreeRDP 2 synthesized KBD_FLAGS_DOWN for every press.
+	 * Checking for KBD_FLAGS_DOWN therefore dropped all key presses.
+	 */
+	if (flags & KBD_FLAGS_RELEASE)
+		keyState = WL_KEYBOARD_KEY_STATE_RELEASED;
+	else
+		keyState = WL_KEYBOARD_KEY_STATE_PRESSED;
+	notify = 1;
+#else
 	if (flags & KBD_FLAGS_DOWN) {
 		keyState = WL_KEYBOARD_KEY_STATE_PRESSED;
 		notify = 1;
@@ -1715,6 +1728,7 @@ xf_input_keyboard_event(rdpInput *input, UINT16 flags, RDP_KBD_CODE_TYPE code)
 		keyState = WL_KEYBOARD_KEY_STATE_RELEASED;
 		notify = 1;
 	}
+#endif
 
 	if (keyboard && notify) {
 		full_code = code;
@@ -1763,7 +1777,13 @@ xf_input_keyboard_event(rdpInput *input, UINT16 flags, RDP_KBD_CODE_TYPE code)
 				vk_code |= KBDEXT;
 
 #if FREERDP_VERSION_MAJOR >= 3
-		scan_code = GetKeycodeFromVirtualKeyCode(vk_code, WINPR_KEYCODE_TYPE_EVDEV);
+		/*
+		 * The code below expects an XKB keycode (evdev + 8), which is what
+		 * KEYCODE_TYPE_EVDEV returned in WinPR 2. In WinPR 3 the EVDEV table
+		 * returns raw evdev codes and the XKB table the +8 variant, so XKB
+		 * is the equivalent here. Using EVDEV shifts every key by 8.
+		 */
+		scan_code = GetKeycodeFromVirtualKeyCode(vk_code, WINPR_KEYCODE_TYPE_XKB);
 #else
 		scan_code = GetKeycodeFromVirtualKeyCode(vk_code, KEYCODE_TYPE_EVDEV);
 #endif
