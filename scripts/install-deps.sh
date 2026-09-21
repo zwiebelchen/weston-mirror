@@ -40,6 +40,7 @@ BUILD_LIBS=(
 	libglib2.0-dev          # glib-2.0 (rdprail-shell)
 	freerdp3-dev            # freerdp3, freerdp-server3
 	libwinpr3-dev           # winpr3
+	libfuse3-dev            # fuse3 (Laufwerksumleitung)
 	libx11-dev              # x11       (Xwayland-Support)
 	libxcb1-dev             # xcb
 	libxcb-composite0-dev   # xcb-composite
@@ -51,6 +52,7 @@ BUILD_LIBS=(
 # Laufzeit
 RUNTIME=(
 	xwayland                # X11-Anwendungen als RemoteApp
+	fuse3                   # fusermount3 fuer die Laufwerksumleitung
 	openssl
 )
 

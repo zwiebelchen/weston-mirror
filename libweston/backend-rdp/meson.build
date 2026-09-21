@@ -55,6 +55,14 @@ deps_rdp = [
 	dep_rdpapplist,
 ]
 
+dep_fuse3 = dependency('fuse3', version: '>= 3.12', required: false)
+if dep_fuse3.found()
+	config_h.set('HAVE_FUSE3', '1')
+	deps_rdp += dep_fuse3
+else
+	message('fuse3 not found: RDP drive redirection disabled')
+endif
+
 dep_openssl = dependency('openssl', version: '>= 1.1.1', required: false)
 if dep_openssl.found()
 	config_h.set('HAVE_OPENSSL', '1')
@@ -68,6 +76,8 @@ srcs_rdp = [
         'rdpclip.c',
         'rdprail.c',
         'rdputil.c',
+        'rdpdrive.c',
+        'rdpdr/rdpdr_server.c',
 ]
 
 plugin_rdp = shared_library(

@@ -18,6 +18,9 @@ einer Anwendung erscheint beim Client als eigenes lokales Fenster.
 | RemoteApp mit `mstsc` (Fenster, Tastatur inkl. Umlaute, Maus) | ja, getestet mit Firefox und weston-terminal |
 | Mehrere Instanzen über eine Verbindung | ja (mstsc nutzt die offene Verbindung) |
 | Abmelden, wenn die letzte App geschlossen wird | ja, nach 5 s |
+| Neue Verbindung übernimmt die laufende Session | ja |
+| Laufwerksumleitung (Client-Laufwerke im Server) | ja, über FUSE (siehe unten) |
+| Druckerumleitung | Drucker werden erkannt und protokolliert, Drucken noch nicht |
 | RemoteApp mit `xfreerdp3` (Linux-Client) | startet, Fensterinhalt bleibt schwarz (Client-Problem) |
 | Mikrofon-Weiterleitung (audin) | unter FreeRDP 3 deaktiviert |
 | App-Liste an den Client publizieren (`rdpapplist`) | nicht verfügbar (Microsoft-eigener Kanal) |
@@ -52,6 +55,7 @@ Benötigte Pakete (Stand Debian 13):
 - **Eingabe:** `libxkbcommon-dev libinput-dev libevdev-dev libudev-dev`
 - **Sonstiges:** `libdrm-dev libpam0g-dev libssl-dev libglib2.0-dev`
 - **RDP:** `freerdp3-dev libwinpr3-dev`
+- **Laufwerke:** `libfuse3-dev fuse3`
 - **Xwayland (X11-Apps):** `libx11-dev libxcb1-dev libxcb-composite0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev`
 - **Laufzeit:** `xwayland openssl`
 
@@ -113,6 +117,31 @@ prompt for credentials:i:0
 ```
 
 `enablecredsspsupport:i:0` ist nötig, weil der Server (noch) kein NLA kann.
+
+Für Laufwerke und Drucker zusätzlich:
+
+```
+drivestoredirect:s:*
+redirectprinters:i:1
+```
+
+## Laufwerksumleitung
+
+Die freigegebenen Laufwerke des Clients erscheinen in der Session unter
+`~/RDP-Laufwerke/<Laufwerk>` (z. B. `~/RDP-Laufwerke/C`), anderer Ort über
+`WESTON_RDP_DRIVES_DIR`, abschalten mit `WESTON_RDP_DISABLE_DRIVES=1`.
+Anwendungen öffnen und speichern dort ganz normal.
+
+Voraussetzungen: Paket `fuse3` und Zugriff auf `/dev/fuse`. Im Proxmox-LXC:
+Optionen → Features → **FUSE** aktivieren.
+
+Einschränkungen: Dateien über 4 GB, Kürzen auf eine andere Größe als 0,
+Zeitstempel und Rechte setzen werden nicht unterstützt (letzteres wird
+stillschweigend akzeptiert, damit `cp -p` & Co. funktionieren).
+
+Der rdpdr-Server stammt aus FreeRDP 3.15 und liegt korrigiert unter
+`libweston/backend-rdp/rdpdr/` (fünf Fehler behoben, die Laufwerke in
+FreeRDP unbenutzbar machen; Details im Dateikopf).
 
 ## Sicherheit – bitte lesen
 

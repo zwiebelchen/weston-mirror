@@ -742,6 +742,7 @@ rdp_peer_context_new(freerdp_peer* client, RdpPeerContext* context)
 	wl_list_init(&context->loop_task_list);
 	wl_list_init(&context->exec_clients);
 	context->logoff_timer = NULL;
+	context->drives = NULL;
 
 	context->rfx_context = rfx_context_new(TRUE);
 	if (!context->rfx_context)
@@ -808,6 +809,8 @@ rdp_peer_context_free(freerdp_peer* client, RdpPeerContext* context)
 		b->audio_out_teardown(context->audio_out_private);
 
 	rdp_clipboard_destroy(context);
+
+	rdp_drives_destroy(context);
 
 	rdp_rail_peer_context_free(client, context);
 
@@ -1253,6 +1256,9 @@ xf_peer_activate_finish(freerdp_peer* client)
 	if (settings->RedirectClipboard)
 		if (rdp_clipboard_init(client) != 0)
 			goto error_exit;
+
+	/* drives and printers shared by the client (rdpdr) */
+	rdp_drives_init(peerCtx);
 
 	peersItem->flags |= RDP_PEER_ACTIVATED;
 

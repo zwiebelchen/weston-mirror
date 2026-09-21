@@ -252,6 +252,9 @@ struct rdp_peer_context {
 	struct wl_list exec_clients;
 	/* disconnects the session once no remote application is left */
 	struct wl_event_source *logoff_timer;
+
+	/* device redirection (rdpdr): client drives via FUSE, printers */
+	struct rdp_drives *drives;
 	struct weston_surface *cursorSurface;
 
 	// list of outstanding event_source sent from FreeRDP thread to display loop.
@@ -501,5 +504,12 @@ should_strip_window_shadow(RdpPeerContext *peerCtx,
 
 	return false;
 }
+
+/* rdpdrive.c */
+void
+rdp_drives_init(RdpPeerContext *peer_ctx);
+
+void
+rdp_drives_destroy(RdpPeerContext *peer_ctx);
 
 #endif
