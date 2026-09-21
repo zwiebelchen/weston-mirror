@@ -636,6 +636,18 @@ DRV_SIMPLE(drv_rmdir, d->rdpdr->DriveDeleteDirectory(d->rdpdr, w, dev, a))
 DRV_SIMPLE(drv_unlink, d->rdpdr->DriveDeleteFile(d->rdpdr, w, dev, a))
 DRV_SIMPLE(drv_rename, d->rdpdr->DriveRenameFile(d->rdpdr, w, dev, a, b))
 
+/* A just closed file may still be open on the client: FUSE sends the
+ * release asynchronously after close(). Retry briefly on EBUSY. */
+#define RETRY_BUSY(expr)						\
+	({								\
+		int _rc = (expr);					\
+		for (int _i = 0; _rc == -EBUSY && _i < 20; _i++) {	\
+			usleep(50 * 1000);				\
+			_rc = (expr);					\
+		}							\
+		_rc;							\
+	})
+
 /* ------------------------------------------------------------------ */
 /* FUSE operations                                                     */
 /* ------------------------------------------------------------------ */
@@ -936,7 +948,7 @@ op_rmdir(const char *path)
 	RESOLVE_OR(-EACCES);
 	int rc;
 
-	rc = drv_rmdir(d, dev, rel, NULL);
+	rc = RETRY_BUSY(drv_rmdir(d, dev, rel, NULL));
 	cache_clear(d);
 	return rc;
 }
@@ -947,7 +959,7 @@ op_unlink(const char *path)
 	RESOLVE_OR(-EACCES);
 	int rc;
 
-	rc = drv_unlink(d, dev, rel, NULL);
+	rc = RETRY_BUSY(drv_unlink(d, dev, rel, NULL));
 	cache_clear(d);
 	return rc;
 }
@@ -969,13 +981,16 @@ op_rename(const char *path, const char *to, unsigned int flags)
 	if (dev_to != dev)
 		return -EXDEV;
 
-	rc = drv_rename(d, dev, rel, rel_to);
+	rc = RETRY_BUSY(drv_rename(d, dev, rel, rel_to));
 	/* POSIX rename replaces an existing target, Windows does not */
 	if (rc == -EEXIST && !(flags & RENAME_NOREPLACE)) {
-		if (drv_unlink(d, dev, rel_to, NULL) == 0)
-			rc = drv_rename(d, dev, rel, rel_to);
+		if (RETRY_BUSY(drv_unlink(d, dev, rel_to, NULL)) == 0)
+			rc = RETRY_BUSY(drv_rename(d, dev, rel, rel_to));
 	}
 	cache_clear(d);
+	if (rc < 0)
+		weston_log("RDP drives: rename '%s' -> '%s' failed (%s)\n",
+			   rel, rel_to, strerror(-rc));
 	return rc;
 }
 

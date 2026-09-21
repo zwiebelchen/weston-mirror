@@ -11,6 +11,7 @@
  *  - completion ids handed out atomically (requests come from several threads)
  *  - optional padding / Information bytes accepted
  *  - added weston_rdpdr_server_send_printer_using_xps (DR_PRN_USING_XPS)
+ *  - share delete, DELETE access for delete/rename, rename replaces target
  *  - one PDU per channel message (leftover padding was parsed as a PDU)
  *  - client capability evaluation fixed (upstream mapped capability types
  *    onto device type bits and disabled drives before seeing their cap)
@@ -2435,7 +2436,12 @@ static UINT rdpdr_server_send_device_create_request(RdpdrServerContext* context,
 	Stream_Write_UINT32(s, 0);             /* AllocationSize (8 bytes) */
 	Stream_Write_UINT32(s, 0);
 	Stream_Write_UINT32(s, 0);                 /* FileAttributes (4 bytes) */
-	Stream_Write_UINT32(s, 3);                 /* SharedAccess (4 bytes) */
+	/* weston-mirror fix: share delete as well. Windows refuses to rename or
+	 * delete a file while another handle lacks FILE_SHARE_DELETE, and FUSE
+	 * closes handles asynchronously (gedit: "Error renaming temporary
+	 * file: Device or resource busy") */
+	Stream_Write_UINT32(s, FILE_SHARE_READ | FILE_SHARE_WRITE |
+	                       FILE_SHARE_DELETE); /* SharedAccess (4 bytes) */
 	Stream_Write_UINT32(s, createDisposition); /* CreateDisposition (4 bytes) */
 	Stream_Write_UINT32(s, createOptions);     /* CreateOptions (4 bytes) */
 	WINPR_ASSERT(pathLength <= UINT32_MAX);
@@ -2630,7 +2636,8 @@ static UINT rdpdr_server_send_device_file_rename_request(RdpdrServerContext* con
 	Stream_Write_UINT32(s, (UINT32)pathLength + 6U); /* Length (4 bytes) */
 	Stream_Zero(s, 24);                              /* Padding (24 bytes) */
 	/* RDP_FILE_RENAME_INFORMATION */
-	Stream_Write_UINT8(s, 0);                   /* ReplaceIfExists (1 byte) */
+	/* weston-mirror fix: POSIX rename semantics, replace the target */
+	Stream_Write_UINT8(s, 1);                   /* ReplaceIfExists (1 byte) */
 	Stream_Write_UINT8(s, 0);                   /* RootDirectory (1 byte) */
 	Stream_Write_UINT32(s, (UINT32)pathLength); /* FileNameLength (4 bytes) */
 
@@ -3510,8 +3517,11 @@ static UINT rdpdr_server_drive_delete_file(RdpdrServerContext* context, void* ca
 
 	/* Send a request to open the file. */
 	return rdpdr_server_send_device_create_request(
-	    context, deviceId, irp->CompletionId, irp->PathName, FILE_READ_DATA | SYNCHRONIZE,
-	    FILE_DELETE_ON_CLOSE | FILE_SYNCHRONOUS_IO_NONALERT, FILE_OPEN);
+	    /* weston-mirror fix: FILE_DELETE_ON_CLOSE needs DELETE access on
+	     * Windows clients */
+	    context, deviceId, irp->CompletionId, irp->PathName,
+	    DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+	    FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE | FILE_SYNCHRONOUS_IO_NONALERT, FILE_OPEN);
 }
 
 /*************************************************
@@ -3680,7 +3690,9 @@ static UINT rdpdr_server_drive_rename_file(RdpdrServerContext* context, void* ca
 	/* Send a request to open the file. */
 	// NOLINTNEXTLINE(clang-analyzer-unix.Malloc): rdpdr_server_enqueue_irp owns irp
 	return rdpdr_server_send_device_create_request(context, deviceId, irp->CompletionId,
-	                                               irp->PathName, FILE_READ_DATA | SYNCHRONIZE,
+	                                               irp->PathName,
+	                                               /* weston-mirror fix: renaming needs DELETE */
+	                                               DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
 	                                               FILE_SYNCHRONOUS_IO_NONALERT, FILE_OPEN);
 }
 
