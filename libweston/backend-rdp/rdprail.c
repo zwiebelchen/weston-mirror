@@ -165,9 +165,9 @@ rail_client_Handshake(RailServerContext *context, const RAIL_HANDSHAKE_ORDER *ha
 #define RDP_RAIL_IDLE_LOGOFF_MS 5000
 
 struct rdp_exec_client {
-	struct wl_list link;			/* RdpPeerContext::exec_clients */
+	struct wl_list link;			/* rdp_backend::exec_clients */
 	struct wl_listener destroy_listener;
-	RdpPeerContext *peer_ctx;
+	struct rdp_backend *b;
 };
 
 static void
@@ -196,10 +196,10 @@ rdp_rail_idle_logoff_timer(void *data)
 	rdp_id_manager_for_each(&peer_ctx->windowId,
 				rdp_rail_count_window_iter, &windows);
 
-	if (windows || !wl_list_empty(&peer_ctx->exec_clients)) {
+	if (windows || !wl_list_empty(&b->exec_clients)) {
 		rdp_debug(b, "idle logoff: still %u window(s), %s programs, keeping session\n",
 			  windows,
-			  wl_list_empty(&peer_ctx->exec_clients) ? "no" : "running");
+			  wl_list_empty(&b->exec_clients) ? "no" : "running");
 		return 0;
 	}
 
@@ -236,8 +236,7 @@ rail_ClientExec_destroy(struct wl_listener *listener, void *data)
 {
 	struct rdp_exec_client *exec_client =
 		container_of(listener, struct rdp_exec_client, destroy_listener);
-	RdpPeerContext *peer_ctx = exec_client->peer_ctx;
-	struct rdp_backend *b = peer_ctx->rdpBackend;
+	struct rdp_backend *b = exec_client->b;
 
 	rdp_debug(b, "Client ExecOrder program terminated\n");
 
@@ -245,7 +244,10 @@ rail_ClientExec_destroy(struct wl_listener *listener, void *data)
 	wl_list_remove(&exec_client->link);
 	free(exec_client);
 
-	rdp_rail_schedule_idle_logoff(peer_ctx);
+	if (b->rdp_peer && b->rdp_peer->context)
+		rdp_rail_schedule_idle_logoff((RdpPeerContext *)b->rdp_peer->context);
+	else
+		rdp_backend_schedule_idle_exit(b);
 }
 
 /*
@@ -500,11 +502,11 @@ rail_client_Exec_callback(bool freeOnly, void *arg)
 			/* every exec order starts a new instance, track them all */
 			struct rdp_exec_client *exec_client = xzalloc(sizeof *exec_client);
 
-			exec_client->peer_ctx = peer_ctx;
+			exec_client->b = b;
 			exec_client->destroy_listener.notify = rail_ClientExec_destroy;
 			wl_client_add_destroy_listener(exec_wl_client,
 						       &exec_client->destroy_listener);
-			wl_list_insert(&peer_ctx->exec_clients, &exec_client->link);
+			wl_list_insert(&b->exec_clients, &exec_client->link);
 			result = RAIL_EXEC_S_OK;
 		} else {
 			rdp_debug_error(b, "%s: fail to launch shell process %s\n",
@@ -4348,17 +4350,6 @@ rdp_rail_peer_context_free(freerdp_peer *client, RdpPeerContext *context)
 		context->rail_server_context = NULL;
 	}
 
-	{
-		struct rdp_exec_client *exec_client, *tmp;
-
-		/* the programs keep running, we only stop tracking them */
-		wl_list_for_each_safe(exec_client, tmp, &context->exec_clients, link) {
-			wl_list_remove(&exec_client->destroy_listener.link);
-			wl_list_remove(&exec_client->link);
-			free(exec_client);
-		}
-	}
-
 	if (context->logoff_timer) {
 		wl_event_source_remove(context->logoff_timer);
 		context->logoff_timer = NULL;
@@ -5372,6 +5363,15 @@ rdp_rail_backend_create(struct rdp_backend *b, struct weston_rdp_backend_config 
 void
 rdp_rail_destroy(struct rdp_backend *b)
 {
+	struct rdp_exec_client *exec_client, *tmp;
+
+	/* the programs keep running, the compositor is going away */
+	wl_list_for_each_safe(exec_client, tmp, &b->exec_clients, link) {
+		wl_list_remove(&exec_client->destroy_listener.link);
+		wl_list_remove(&exec_client->link);
+		free(exec_client);
+	}
+
 	if (b->create_window_listener.notify) {
 		wl_list_remove(&b->create_window_listener.link);
 		b->create_window_listener.notify = NULL;

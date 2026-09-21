@@ -88,6 +88,21 @@ struct rdp_backend {
 	struct weston_backend base;
 	struct weston_compositor *compositor;
 
+	/* programs started for clients (RAIL exec orders). Tracked by the
+	 * backend, not the peer: they outlive disconnects and takeovers. */
+	struct wl_list exec_clients;
+
+	/* session broker mode (WESTON_RDP_CONTROL_SOCKET): connections are
+	 * handed over as file descriptors instead of accepted on a port */
+	int control_fd;
+	char *control_path;
+	struct wl_event_source *control_source;
+
+	/* WESTON_RDP_IDLE_EXIT_SEC: exit when no client is connected and no
+	 * program started for a client is running */
+	int idle_exit_sec;
+	struct wl_event_source *idle_exit_timer;
+
 	freerdp_listener *listener;
 	struct wl_event_source *listener_events[MAX_FREERDP_FDS];
 	struct wl_list output_list; // rdp_output::link
@@ -247,9 +262,6 @@ struct rdp_peer_context {
 	uint32_t currentFrameId;
 	uint32_t acknowledgedFrameId;
 	bool isAcknowledgedSuspended;
-	/* programs started on behalf of the client (RAIL exec orders);
-	 * several instances may run at the same time */
-	struct wl_list exec_clients;
 	/* disconnects the session once no remote application is left */
 	struct wl_event_source *logoff_timer;
 
@@ -511,5 +523,9 @@ rdp_drives_init(RdpPeerContext *peer_ctx);
 
 void
 rdp_drives_destroy(RdpPeerContext *peer_ctx);
+
+/* rdp.c */
+void
+rdp_backend_schedule_idle_exit(struct rdp_backend *b);
 
 #endif

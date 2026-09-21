@@ -1,0 +1,14 @@
+[Unit]
+Description=weston-mirror RAIL session broker (RDP RemoteApp, one session per user)
+After=network-online.target systemd-logind.service cups.service
+Wants=network-online.target
+
+[Service]
+ExecStart=@sbindir@/weston-rail-broker
+Restart=on-failure
+# sessions run in their own PAM/logind sessions; do not kill them when the
+# broker restarts
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

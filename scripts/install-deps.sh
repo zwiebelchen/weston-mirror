@@ -57,7 +57,8 @@ RUNTIME=(
 	cups-client             # lpadmin, lpstat, lpoptions
 	cups-filters            # Umwandlung der Druckdaten nach PDF/PostScript
 	ghostscript             # PDF -> XPS (xpswrite) fuer mstsc-Drucker
-	openssl
+	openssl                 # TLS-Zertifikat des Session-Brokers
+	dbus-user-session       # dbus-run-session fuer die Sessions (Broker)
 )
 
 strip_comments() {

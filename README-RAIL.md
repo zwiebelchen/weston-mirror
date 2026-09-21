@@ -25,7 +25,7 @@ einer Anwendung erscheint beim Client als eigenes lokales Fenster.
 | Mikrofon-Weiterleitung (audin) | unter FreeRDP 3 deaktiviert |
 | App-Liste an den Client publizieren (`rdpapplist`) | nicht verfügbar (Microsoft-eigener Kanal) |
 | Allowlist für startbare Programme | ja (`/etc/weston-rail/apps.conf`) |
-| Authentifizierung | **fehlt** (siehe Sicherheit) |
+| Session pro User mit PAM-Login | ja, `weston-rail-broker` (siehe unten) |
 | Session pro User | geplant (siehe Roadmap) |
 
 ## Schnellstart
@@ -149,11 +149,13 @@ FreeRDP unbenutzbar machen; Details im Dateikopf).
 
 Aktuell **nicht** im offenen Netz betreiben:
 
-- Es gibt **keine Authentifizierung**. NLA ist aus, Benutzername und Passwort
-  werden nicht geprüft. Wer den Port erreicht, bekommt eine Session.
+- Beim **direkten Start** von Weston gibt es keine Authentifizierung: Wer den
+  Port erreicht, bekommt eine Session des startenden Users. Im Betrieb daher
+  den **Session-Broker** verwenden (PAM-Login, eine Session pro User).
+- NLA wird noch nicht unterstützt; Zugangsdaten gehen TLS-verschlüsselt im
+  Client-Info-PDU über die Leitung.
 - Startbar sind nur Programme aus der Allowlist. Ein Terminal gehört nicht
   hinein, sonst hat jeder Client eine Shell.
-- Nur eine RDP-Verbindung pro Weston-Instanz.
 
 ## Allowlist: veröffentlichte Programme
 
@@ -212,26 +214,62 @@ sudo systemctl restart cups        # nach ./build.sh install (neuer MIME-Typ)
 Filter nach `/usr/lib/cups/filter/rdpxps`. Das Backend liefert nur an einen
 Socket in `/run/user/<uid>` des Auftrags-Users, der diesem User gehört.
 
-## Roadmap: Session pro User
+## Session-Broker: eine Session pro User
 
-Der RAIL-Modus erlaubt nur einen Peer pro Compositor. Deshalb bekommt jeder
-User eine eigene Weston-Instanz, verwaltet von einem Session-Broker:
+Für den Mehrbenutzerbetrieb startet man Weston nicht mehr selbst, sondern
+den Broker. Er läuft als root auf Port 3389:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now weston-rail-broker
+journalctl -u weston-rail-broker -f          # Log des Brokers
+```
+
+Ablauf:
+
+1. mstsc verbindet sich, der Broker prüft Benutzername und Passwort per PAM
+   (Dienst `weston-rail`, `/etc/pam.d/weston-rail`) gegen die Linux-Konten.
+2. Der Broker leitet den Client mit einem Einmal-Token (60 s gültig) auf sich
+   selbst um. mstsc verbindet sich sofort neu, das sieht man nicht.
+3. Die neue Verbindung geht an die Weston-Instanz des Users. Hat er noch
+   keine, startet der Broker sie unter seinem Konto: eigene PAM-/logind-
+   Session, `/run/user/<uid>`, eigener D-Bus, Locale aus `/etc/default/locale`.
+4. Weitere Verbindungen desselben Users (zweite App, Wiederverbinden)
+   landen in derselben Instanz. Andere User bekommen ihre eigene.
+5. Ist kein Client mehr verbunden und keine App mehr offen, endet die
+   Session nach 60 s (`--idle-exit=SEK`).
+
+`.rdp`-Datei für den Broker:
 
 ```
-Port 3389 → Broker (root: TLS, PAM-Login, Routing)
-              ├── User A → weston --env-socket (als A) → Apps
-              └── User B → weston --env-socket (als B) → Apps
+full address:s:SERVER:3389
+remoteapplicationmode:i:1
+remoteapplicationprogram:s:||firefox
+remoteapplicationname:s:Firefox
+enablecredsspsupport:i:0
+prompt for credentials:i:1
+authentication level:i:0
+disableconnectionsharing:i:1
+drivestoredirect:s:*
+redirectprinters:i:1
 ```
 
-Weston kann eine vom Broker angenommene Verbindung per `--env-socket` und
-Umgebungsvariable `RDP_FD` übernehmen.
+`prompt for credentials:i:1` sorgt dafür, dass mstsc Benutzername und
+Passwort abfragt und mitschickt (ohne NLA). Root-Anmeldungen sind gesperrt
+(`--allow-root`).
 
-1. Broker mit festem Service-User + Allowlist für startbare Programme
-2. PAM-Login im Broker, Weiterleitung per RDP-Server-Redirection mit Routing-Token
-3. Wiederverbinden in eine laufende Session (FD-Übergabe per `SCM_RIGHTS`)
+TLS: Beim ersten Start erzeugt der Broker `/etc/weston-rail/tls.crt/.key`
+(selbstsigniert). Jede Session bekommt eine Kopie, damit der Client nur ein
+Zertifikat sieht. Ein eigenes Zertifikat einfach dort ablegen.
 
-Mehrere Instanzen derselben Anwendung sind innerhalb einer Session einfach
-weitere Wayland-Clients; jedes Fenster wird ein eigenes RAIL-Fenster.
+Log einer Session: `/run/user/<uid>/weston-rail.log`.
+
+Drucken im Mehrbenutzerbetrieb: Jeder User braucht die Gruppe `lpadmin`,
+damit seine Session Warteschlangen anlegen darf.
+
+Optionen: `weston-rail-broker --help` (Port, Zertifikat, Weston-Pfad,
+Leerlaufzeit). Für Tests ohne Broker funktioniert der direkte Start von
+Weston wie oben weiterhin.
 
 ## Änderungen gegenüber microsoft/weston-mirror
 

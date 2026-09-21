@@ -37,6 +37,8 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/eventfd.h>
+#include <sys/un.h>
+#include <sys/stat.h>
 #include <netdb.h>
 #include <linux/vm_sockets.h>
 #include <netinet/in.h>
@@ -661,6 +663,17 @@ rdp_destroy(struct weston_compositor *ec)
 		if (b->listener_events[i])
 			wl_event_source_remove(b->listener_events[i]);
 
+	if (b->control_source)
+		wl_event_source_remove(b->control_source);
+	if (b->control_fd >= 0)
+		close(b->control_fd);
+	if (b->control_path) {
+		unlink(b->control_path);
+		free(b->control_path);
+	}
+	if (b->idle_exit_timer)
+		wl_event_source_remove(b->idle_exit_timer);
+
 	rdp_rail_destroy(b);
 
 	if (b->debugClipboard) {
@@ -740,7 +753,6 @@ rdp_peer_context_new(freerdp_peer* client, RdpPeerContext* context)
 	context->loop_task_event_source_fd = -1;
 	context->loop_task_event_source = NULL;
 	wl_list_init(&context->loop_task_list);
-	wl_list_init(&context->exec_clients);
 	context->logoff_timer = NULL;
 	context->drives = NULL;
 
@@ -822,8 +834,10 @@ rdp_peer_context_free(freerdp_peer* client, RdpPeerContext* context)
 	rdp_destroy_dispatch_task_event_source(context);
 
 	/* clear the peer, in RAIL mode, this allows new peer to connect */
-	if (context->rdpBackend->rdp_peer == client)
+	if (context->rdpBackend->rdp_peer == client) {
 		context->rdpBackend->rdp_peer = NULL;
+		rdp_backend_schedule_idle_exit(context->rdpBackend);
+	}
 
 	if (context->item.flags & RDP_PEER_ACTIVATED) {
 		weston_seat_release_keyboard(context->item.seat);
@@ -2339,6 +2353,128 @@ static int use_vsock_fd(int port)
 
 extern char **environ; /* defined by libc */
 
+
+/* ---- session broker support ---------------------------------------- */
+
+static int
+rdp_idle_exit_timer(void *data)
+{
+	struct rdp_backend *b = data;
+
+	if (b->rdp_peer || !wl_list_empty(&b->exec_clients))
+		return 0;
+	weston_log("RDP: no client connected and no program running for %d s, "
+		   "ending the session\n", b->idle_exit_sec);
+	weston_compositor_exit(b->compositor);
+	return 0;
+}
+
+/* Called whenever the last client disconnected or the last program a
+ * client started ended. The timer re-checks both conditions. */
+void
+rdp_backend_schedule_idle_exit(struct rdp_backend *b)
+{
+	if (b->idle_exit_sec <= 0)
+		return;
+	if (!b->idle_exit_timer) {
+		struct wl_event_loop *loop =
+			wl_display_get_event_loop(b->compositor->wl_display);
+
+		b->idle_exit_timer = wl_event_loop_add_timer(loop, rdp_idle_exit_timer, b);
+		if (!b->idle_exit_timer)
+			return;
+	}
+	wl_event_source_timer_update(b->idle_exit_timer, b->idle_exit_sec * 1000);
+}
+
+/* The broker passes accepted RDP connections as file descriptors
+ * (SCM_RIGHTS), one per control connection. */
+static int
+rdp_control_activity(int fd, uint32_t mask, void *data)
+{
+	struct rdp_backend *b = data;
+	struct ucred cred;
+	socklen_t cl = sizeof cred;
+	char byte;
+	struct iovec iov = { .iov_base = &byte, .iov_len = 1 };
+	union {
+		struct cmsghdr hdr;
+		char buf[CMSG_SPACE(sizeof(int))];
+	} ctrl;
+	struct msghdr msg = {
+		.msg_iov = &iov, .msg_iovlen = 1,
+		.msg_control = ctrl.buf, .msg_controllen = sizeof ctrl.buf,
+	};
+	struct cmsghdr *cmsg;
+	int conn, peer_fd = -1;
+	ssize_t n;
+
+	conn = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
+	if (conn < 0)
+		return 1;
+	if (getsockopt(conn, SOL_SOCKET, SO_PEERCRED, &cred, &cl) < 0 ||
+	    (cred.uid != 0 && cred.uid != getuid())) {
+		weston_log("RDP control: connection from uid %u refused\n",
+			   (unsigned)cred.uid);
+		close(conn);
+		return 1;
+	}
+	do {
+		n = recvmsg(conn, &msg, MSG_CMSG_CLOEXEC);
+	} while (n < 0 && errno == EINTR);
+	for (cmsg = CMSG_FIRSTHDR(&msg); n > 0 && cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+		if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+		    cmsg->cmsg_len == CMSG_LEN(sizeof(int)))
+			memcpy(&peer_fd, CMSG_DATA(cmsg), sizeof(int));
+	}
+	if (peer_fd < 0) {
+		weston_log("RDP control: no connection received\n");
+		close(conn);
+		return 1;
+	}
+	/* acknowledge, so the broker knows the connection was taken over */
+	n = write(conn, "OK\n", 3);
+	(void)n;
+	close(conn);
+
+	weston_log("RDP control: connection handed over by the session broker\n");
+	if (rdp_peer_init(freerdp_peer_new(peer_fd), b) < 0) {
+		weston_log("RDP control: cannot initialize the connection\n");
+		close(peer_fd);
+	}
+	return 1;
+}
+
+static bool
+rdp_control_socket_create(struct rdp_backend *b, const char *path)
+{
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	struct wl_event_loop *loop;
+
+	if (strlen(path) >= sizeof addr.sun_path)
+		return false;
+	strcpy(addr.sun_path, path);
+	unlink(path);
+	b->control_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (b->control_fd < 0)
+		return false;
+	if (bind(b->control_fd, (struct sockaddr *)&addr, sizeof addr) < 0 ||
+	    listen(b->control_fd, 8) < 0) {
+		weston_log("RDP control: cannot listen on %s: %s\n", path, strerror(errno));
+		close(b->control_fd);
+		b->control_fd = -1;
+		return false;
+	}
+	chmod(path, 0600);
+	loop = wl_display_get_event_loop(b->compositor->wl_display);
+	b->control_source = wl_event_loop_add_fd(loop, b->control_fd, WL_EVENT_READABLE,
+						 rdp_control_activity, b);
+	b->control_path = strdup(path);
+	weston_log("RDP control: waiting for connections from the session broker on %s\n",
+		   path);
+	return true;
+}
+
 static struct rdp_backend *
 rdp_backend_create(struct weston_compositor *compositor,
 		   struct weston_rdp_backend_config *config)
@@ -2360,6 +2496,8 @@ rdp_backend_create(struct weston_compositor *compositor,
 
 	b->compositor_tid = rdp_get_tid();
 	b->compositor = compositor;
+	wl_list_init(&b->exec_clients);
+	b->control_fd = -1;
 	b->base.destroy = rdp_destroy;
 	b->base.create_output = rdp_output_create;
 	b->rdp_key = config->rdp_key ? strdup(config->rdp_key) : NULL;
@@ -2476,7 +2614,19 @@ rdp_backend_create(struct weston_compositor *compositor,
 
 	compositor->capabilities |= WESTON_CAP_ARBITRARY_MODES;
 
-	if (!config->env_socket) {
+	{
+		const char *idle = getenv("WESTON_RDP_IDLE_EXIT_SEC");
+
+		b->idle_exit_sec = idle ? atoi(idle) : 0;
+	}
+
+	if (getenv("WESTON_RDP_CONTROL_SOCKET")) {
+		/* session broker mode: no port of our own, connections arrive
+		 * through the control socket */
+		if (!rdp_control_socket_create(b, getenv("WESTON_RDP_CONTROL_SOCKET")))
+			goto err_output;
+		rdp_backend_schedule_idle_exit(b);
+	} else if (!config->env_socket) {
 		b->listener = freerdp_listener_new();
 		b->listener->PeerAccepted = rdp_incoming_peer;
 		b->listener->param4 = b;
