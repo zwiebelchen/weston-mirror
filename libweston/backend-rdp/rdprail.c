@@ -261,6 +261,11 @@ rail_client_Exec_callback(bool freeOnly, void *arg)
 	RAIL_EXEC_RESULT_ORDER orderResult = {};
 	char *remoteProgramAndArgs = exec->RemoteApplicationProgram;
 
+	weston_log("RDP RAIL: client requests program:%s args:%s workdir:%s (flags 0x%08X)\n",
+		   exec->RemoteApplicationProgram,
+		   exec->RemoteApplicationArguments,
+		   exec->RemoteApplicationWorkingDir,
+		   (UINT)exec->flags);
 	rdp_debug(b, "Client ExecOrder:0x%08X, Program:%s, WorkingDir:%s, RemoteApplicationArguments:%s\n",
 		  (UINT)exec->flags,
 		  exec->RemoteApplicationProgram,

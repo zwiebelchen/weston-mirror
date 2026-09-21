@@ -2154,6 +2154,9 @@ static BOOL
 rdp_incoming_peer(freerdp_listener *instance, freerdp_peer *client)
 {
 	struct rdp_backend *b = (struct rdp_backend *)instance->param4;
+
+	weston_log("RDP: incoming connection from %s%s\n", client->hostname,
+		   b->rdp_peer ? " (another RAIL session is still connected)" : "");
 	if (rdp_peer_init(client, b) < 0) {
 		rdp_debug_error(b, "error when treating incoming peer\n");
 		return FALSE;
