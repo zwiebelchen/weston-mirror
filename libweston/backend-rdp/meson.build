@@ -81,6 +81,7 @@ install_data('cups/rdpxps',
 install_data('cups/weston-rail.types',
 	install_dir: join_paths(dir_cups_datadir, 'mime'))
 install_data('cups/rdp-xps.ppd', install_dir: dir_weston_rail_data)
+install_data('../../data/weston-rail/apps.conf.example', install_dir: dir_weston_rail_data)
 
 dep_openssl = dependency('openssl', version: '>= 1.1.1', required: false)
 if dep_openssl.found()

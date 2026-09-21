@@ -24,6 +24,7 @@ einer Anwendung erscheint beim Client als eigenes lokales Fenster.
 | RemoteApp mit `xfreerdp3` (Linux-Client) | startet, Fensterinhalt bleibt schwarz (Client-Problem) |
 | Mikrofon-Weiterleitung (audin) | unter FreeRDP 3 deaktiviert |
 | App-Liste an den Client publizieren (`rdpapplist`) | nicht verfügbar (Microsoft-eigener Kanal) |
+| Allowlist für startbare Programme | ja (`/etc/weston-rail/apps.conf`) |
 | Authentifizierung | **fehlt** (siehe Sicherheit) |
 | Session pro User | geplant (siehe Roadmap) |
 
@@ -102,7 +103,7 @@ selbstsigniertes Zertifikat. Mehr Debug-Ausgaben: `WESTON_RDP_DEBUG_LEVEL=4`.
 Client (Linux):
 
 ```bash
-xfreerdp3 /v:SERVER:3389 /app:program:/usr/bin/weston-terminal /cert:ignore
+xfreerdp3 /v:SERVER:3389 /app:program:'||terminal' /cert:ignore
 ```
 
 Client (Windows, empfohlen): `.rdp`-Datei mit
@@ -110,7 +111,7 @@ Client (Windows, empfohlen): `.rdp`-Datei mit
 ```
 full address:s:SERVER:3389
 remoteapplicationmode:i:1
-remoteapplicationprogram:s:/usr/bin/firefox
+remoteapplicationprogram:s:||firefox
 remoteapplicationname:s:Firefox
 enablecredsspsupport:i:0
 authentication level:i:0
@@ -150,9 +151,39 @@ Aktuell **nicht** im offenen Netz betreiben:
 
 - Es gibt **keine Authentifizierung**. NLA ist aus, Benutzername und Passwort
   werden nicht geprüft. Wer den Port erreicht, bekommt eine Session.
-- Der Client bestimmt, **welches Programm** gestartet wird. Jeder absolute Pfad
-  ist erlaubt, also auch ein Terminal. Eine Allowlist ist geplant.
+- Startbar sind nur Programme aus der Allowlist. Ein Terminal gehört nicht
+  hinein, sonst hat jeder Client eine Shell.
 - Nur eine RDP-Verbindung pro Weston-Instanz.
+
+## Allowlist: veröffentlichte Programme
+
+Ein Client kann nur Programme starten, die in `/etc/weston-rail/apps.conf`
+stehen (`./build.sh install` legt beim ersten Mal eine Beispieldatei an).
+Die Datei wird bei jedem Start neu gelesen, Änderungen gelten sofort.
+
+```ini
+[app]
+name=firefox
+command=/usr/bin/firefox
+client-arguments=false
+
+[app]
+name=writer
+command=/usr/bin/libreoffice --writer
+client-arguments=true
+```
+
+In der `.rdp`-Datei wird das Programm über seinen Namen angefordert, wie bei
+Windows-RemoteApps: `remoteapplicationprogram:s:||firefox`. Der Pfad aus
+`command` (`/usr/bin/firefox`) wird ebenfalls akzeptiert. `command` wird ohne
+Shell ausgeführt; Argumente mit Leerzeichen in Anführungszeichen setzen.
+Argumente aus der `.rdp`-Datei (`remoteapplicationcmdline:s:…`) werden nur
+mit `client-arguments=true` angehängt, sonst ignoriert.
+
+Alles andere lehnt der Server ab (mstsc zeigt dann, dass das Programm nicht
+in der Liste der zulässigen Programme steht). Nur zum Testen lässt sich die
+Prüfung mit `WESTON_RAIL_ALLOW_ANY_PROGRAM=1` abschalten – dann kann jeder
+Client z. B. eine Shell starten. Andere Datei: `WESTON_RAIL_APPS_CONF=/pfad`.
 
 ## Druckerumleitung
 

@@ -100,6 +100,12 @@ case "${1:-build}" in
 		((EUID != 0)) && SUDO="sudo"
 		$SUDO ninja -C "$BUILD_DIR" install
 		$SUDO ldconfig
+		INSTALLED_PREFIX_TMP="$(meson configure "$BUILD_DIR" 2>/dev/null | awk '$1=="prefix"{print $2; exit}')"
+		if [[ ! -e /etc/weston-rail/apps.conf ]]; then
+			$SUDO install -D -m 644 "${INSTALLED_PREFIX_TMP:-$PREFIX}/share/weston-rail/apps.conf.example" \
+				/etc/weston-rail/apps.conf
+			echo "Allowlist angelegt: /etc/weston-rail/apps.conf (bitte anpassen)"
+		fi
 		INSTALLED_PREFIX="$(meson configure "$BUILD_DIR" 2>/dev/null | awk '$1=="prefix"{print $2; exit}')"
 		echo "Installiert nach ${INSTALLED_PREFIX:-$PREFIX}"
 		;;
