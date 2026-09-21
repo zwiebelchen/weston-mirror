@@ -61,6 +61,8 @@
 #include <freerdp/crypto/certificate.h>
 #include <freerdp/crypto/privatekey.h>
 #include <winpr/ssl.h>
+#include <winpr/ntlm.h>
+#include <winpr/string.h>
 #include <winpr/synch.h>
 
 #ifndef WESTON_BINARY
@@ -87,19 +89,38 @@ static struct {
 	bool verbose;
 	char *names[16];	/* --name: extra DNS names for the certificate */
 	int n_names;
+	char *sam;		/* NT hashes for NLA/NTLM (weston-rail-passwd) */
+	char *keytab;		/* Kerberos keytab for NLA in an AD domain */
+	bool nla;		/* offer NLA (CredSSP) */
+	bool tls_login;		/* accept logins without NLA (Client Info) */
+	int user_map;		/* how NLA user/domain map to a Linux account */
 } cfg = {
 	.port = 3389,
 	.cert = "/etc/weston-rail/tls.crt",
 	.key = "/etc/weston-rail/tls.key",
 	.weston = WESTON_BINARY,
 	.idle_exit_sec = 60,
+	.sam = "/etc/weston-rail/ntlm.sam",
+	.keytab = "/etc/weston-rail/krb5.keytab",
+	.nla = true,
+	.tls_login = true,
 };
+
+enum { USER_MAP_PLAIN, USER_MAP_UPN, USER_MAP_NETBIOS };
 
 struct pending {
 	struct pending *next;
 	char token[TOKEN_HEX_LEN + 1];
-	char user[64];
+	char user[64];		/* Linux account */
+	char client_user[128];	/* name the client authenticates with */
+	char nthash[33];	/* for NLA on the reconnect (may be empty) */
 	time_t expires;
+};
+
+struct login {
+	char user[64];
+	char client_user[128];
+	char nthash[33];
 };
 
 struct session {
@@ -236,7 +257,7 @@ pam_check(const char *user, const char *password, const char *rhost)
 /* ------------------------------------------------------------------ */
 
 static bool
-token_create(const char *user, char out[TOKEN_HEX_LEN + 1])
+token_create(const struct login *login, char out[TOKEN_HEX_LEN + 1])
 {
 	unsigned char raw[TOKEN_HEX_LEN / 2];
 	struct pending *p;
@@ -252,7 +273,9 @@ token_create(const char *user, char out[TOKEN_HEX_LEN + 1])
 	if (!p)
 		return false;
 	memcpy(p->token, out, sizeof p->token);
-	snprintf(p->user, sizeof p->user, "%s", user);
+	snprintf(p->user, sizeof p->user, "%s", login->user);
+	snprintf(p->client_user, sizeof p->client_user, "%s", login->client_user);
+	snprintf(p->nthash, sizeof p->nthash, "%s", login->nthash);
 	p->expires = time(NULL) + TOKEN_LIFETIME_SEC;
 	pthread_mutex_lock(&lock);
 	p->next = pendings;
@@ -263,7 +286,7 @@ token_create(const char *user, char out[TOKEN_HEX_LEN + 1])
 
 /* one-time: a matching token is removed */
 static bool
-token_take(const char *token, char user[64])
+token_take(const char *token, struct login *login)
 {
 	struct pending **pp, *p;
 	time_t now = time(NULL);
@@ -277,7 +300,10 @@ token_take(const char *token, char user[64])
 			continue;
 		}
 		if (!found && strcmp(p->token, token) == 0) {
-			snprintf(user, 64, "%s", p->user);
+			memset(login, 0, sizeof *login);
+			snprintf(login->user, sizeof login->user, "%s", p->user);
+			snprintf(login->client_user, sizeof login->client_user, "%s", p->client_user);
+			snprintf(login->nthash, sizeof login->nthash, "%s", p->nthash);
 			*pp = p->next;
 			free(p);
 			found = true;
@@ -415,6 +441,12 @@ session_keeper(const struct passwd *pw, const char *ctl)
 		setenv("XDG_RUNTIME_DIR", rundir, 1);
 		setenv("XDG_SESSION_TYPE", "wayland", 1);
 		setenv("WESTON_RDP_CONTROL_SOCKET", ctl, 1);
+		{
+			char sam[128];
+
+			snprintf(sam, sizeof sam, "%s/weston-rail-ntlm.sam", rundir);
+			setenv("WESTON_RDP_NLA_SAM", sam, 1);
+		}
 		snprintf(idle, sizeof idle, "%d", cfg.idle_exit_sec);
 		setenv("WESTON_RDP_IDLE_EXIT_SEC", idle, 1);
 
@@ -456,6 +488,12 @@ session_keeper(const struct passwd *pw, const char *ctl)
 		while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
 			;
 	unlink(ctl);
+	{
+		char sam[128];
+
+		snprintf(sam, sizeof sam, "%s/weston-rail-ntlm.sam", rundir);
+		unlink(sam);
+	}
 	unlink(certpath);
 	unlink(keypath);
 	if (pamh) {
@@ -612,15 +650,81 @@ send_fd(const char *ctl, int fd)
 	return true;
 }
 
+
+static bool
+nt_hash_hex(const char *password, char out[33])
+{
+	WCHAR *wide;
+	size_t wlen = 0;
+	BYTE hash[16];
+	bool ok;
+	int i;
+
+	out[0] = '\0';
+	wide = ConvertUtf8ToWCharAlloc(password, &wlen);
+	if (!wide)
+		return false;
+	ok = NTOWFv1W(wide, (UINT32)(wlen * sizeof(WCHAR)), hash);
+	memset(wide, 0, wlen * sizeof(WCHAR));
+	free(wide);
+	if (!ok)
+		return false;
+	for (i = 0; i < 16; i++)
+		sprintf(out + 2 * i, "%02X", hash[i]);
+	memset(hash, 0, sizeof hash);
+	return true;
+}
+
+/*
+ * The user's own NT hash for NLA on the reconnect, in the private runtime
+ * directory. Written to a temporary name and renamed: rename() replaces a
+ * symlink the user may have placed instead of following it.
+ */
 static void
-handoff(int fd, const char *user)
+write_session_sam(const struct login *login)
+{
+	struct passwd pwbuf, *pw = NULL;
+	char buf[4096], path[128], tmp[160], line[256];
+	int fd;
+
+	if (!login->nthash[0] || !login->client_user[0] ||
+	    strchr(login->client_user, ':') || strchr(login->client_user, '\n'))
+		return;
+	if (getpwnam_r(login->user, &pwbuf, buf, sizeof buf, &pw) != 0 || !pw)
+		return;
+	snprintf(path, sizeof path, "/run/user/%u/weston-rail-ntlm.sam", (unsigned)pw->pw_uid);
+	snprintf(tmp, sizeof tmp, "%s.%d", path, (int)getpid());
+	unlink(tmp);
+	fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+	if (fd < 0)
+		return;
+	/* the client's user name and, for NTLM's domain fallback, without domain */
+	snprintf(line, sizeof line, "%s:::%s:::\n", login->client_user, login->nthash);
+	if (write(fd, line, strlen(line)) != (ssize_t)strlen(line) ||
+	    fchown(fd, pw->pw_uid, pw->pw_gid) < 0) {
+		close(fd);
+		unlink(tmp);
+		return;
+	}
+	close(fd);
+	if (rename(tmp, path) < 0)
+		unlink(tmp);
+}
+
+static void
+handoff(int fd, const struct login *login)
 {
 	char ctl[108];
 
-	if (!session_get(user, ctl) || !send_fd(ctl, fd))
-		logmsg("could not hand the connection of %s to the session", user);
-	else
-		logmsg("connection of %s handed to the session", user);
+	if (!session_get(login->user, ctl)) {
+		logmsg("could not start a session for %s", login->user);
+	} else {
+		write_session_sam(login);
+		if (!send_fd(ctl, fd))
+			logmsg("could not hand the connection of %s to the session", login->user);
+		else
+			logmsg("connection of %s handed to the session", login->user);
+	}
 	close(fd);
 }
 
@@ -634,6 +738,7 @@ struct auth_ctx {
 	char local_addr[64];
 	bool redirected;
 	bool failed;
+	char nla_user[64];	/* Linux user authenticated by NLA */
 };
 
 static void
@@ -645,6 +750,118 @@ split_user(const char *in, char *out, size_t size)
 		in = p + 1;
 	snprintf(out, size, "%s", in);
 	out[strcspn(out, "@")] = '\0';		/* user@domain */
+}
+
+
+/* NLA user and domain -> Linux account name */
+static void
+map_nla_user(const char *user, const char *domain, char *out, size_t size)
+{
+	char u[128], d[128];
+	const char *at;
+
+	snprintf(u, sizeof u, "%s", user);
+	snprintf(d, sizeof d, "%s", domain ? domain : "");
+	/* "user@realm" typed as user name */
+	at = strchr(u, '@');
+	if (at && !*d) {
+		snprintf(d, sizeof d, "%s", at + 1);
+		u[at - u] = '\0';
+	}
+	switch (cfg.user_map) {
+	case USER_MAP_UPN:
+		if (*d)
+			snprintf(out, size, "%s@%s", u, d);
+		else
+			snprintf(out, size, "%s", u);
+		break;
+	case USER_MAP_NETBIOS:
+		if (*d)
+			snprintf(out, size, "%s\\%s", d, u);
+		else
+			snprintf(out, size, "%s", u);
+		break;
+	default:
+		snprintf(out, size, "%s", u);
+		break;
+	}
+}
+
+static void
+wide_to_utf8(const UINT16 *w, UINT32 len, char *out, size_t size)
+{
+	out[0] = '\0';
+	if (w && len)
+		if (ConvertWCharNToUtf8((const WCHAR *)w, len, out, size) < 0)
+			out[0] = '\0';
+}
+
+/*
+ * Called by FreeRDP once NLA (CredSSP) succeeded: NTLM against the NT
+ * hash file, or Kerberos against the keytab. The client then delegates
+ * its password (TSPasswordCreds), which is checked with PAM as well, so
+ * locked or expired accounts are refused and the session gets a proper
+ * PAM login.
+ */
+static BOOL
+auth_logon(freerdp_peer *peer, const SEC_WINNT_AUTH_IDENTITY *identity, BOOL automatic)
+{
+	struct auth_ctx *ctx = (struct auth_ctx *)peer->context;
+	char user[128], domain[128], password[512], linux_user[160];
+	BOOL ok = FALSE;
+
+	if (!automatic || !identity)
+		return TRUE;	/* not NLA: credentials follow in the Client Info PDU */
+
+	if (ctx->nla_user[0])
+		return TRUE;	/* FreeRDP may report the logon more than once */
+
+	user[0] = domain[0] = password[0] = '\0';
+	if (identity->UserLength) {
+		if (identity->Flags & SEC_WINNT_AUTH_IDENTITY_UNICODE) {
+			wide_to_utf8(identity->User, identity->UserLength, user, sizeof user);
+			wide_to_utf8(identity->Domain, identity->DomainLength, domain, sizeof domain);
+			wide_to_utf8(identity->Password, identity->PasswordLength, password,
+				     sizeof password);
+		} else {
+			snprintf(user, sizeof user, "%.*s", (int)identity->UserLength,
+				 (const char *)identity->User);
+			snprintf(domain, sizeof domain, "%.*s", (int)identity->DomainLength,
+				 (const char *)identity->Domain);
+			snprintf(password, sizeof password, "%.*s", (int)identity->PasswordLength,
+				 (const char *)identity->Password);
+		}
+	} else {
+		/* FreeRDP 3 stores the delegated credentials (TSPasswordCreds)
+		 * in the settings, the identity stays empty */
+		rdpSettings *settings = peer->context->settings;
+		const char *v;
+
+		if ((v = freerdp_settings_get_string(settings, FreeRDP_Username)))
+			snprintf(user, sizeof user, "%s", v);
+		if ((v = freerdp_settings_get_string(settings, FreeRDP_Domain)))
+			snprintf(domain, sizeof domain, "%s", v);
+		if ((v = freerdp_settings_get_string(settings, FreeRDP_Password)))
+			snprintf(password, sizeof password, "%s", v);
+	}
+	map_nla_user(user, domain, linux_user, sizeof linux_user);
+
+	if (!*password) {
+		/* e.g. Restricted Admin / Remote Credential Guard: no password */
+		logmsg("NLA user %s from %s delegated no password, refused", linux_user,
+		       ctx->rhost);
+	} else if (!valid_username(linux_user) &&
+		   cfg.user_map == USER_MAP_PLAIN) {
+		logmsg("NLA user '%s' from %s: invalid user name", linux_user, ctx->rhost);
+	} else if (pam_check(linux_user, password, ctx->rhost)) {
+		snprintf(ctx->nla_user, sizeof ctx->nla_user, "%s", linux_user);
+		logmsg("user %s authenticated with NLA from %s", linux_user, ctx->rhost);
+		ok = TRUE;
+	}
+	memset(password, 0, sizeof password);
+	if (!ok)
+		ctx->failed = true;
+	return ok;
 }
 
 static BOOL
@@ -659,27 +876,60 @@ auth_post_connect(freerdp_peer *peer)
 	UINT32 missing = 0;
 	BOOL ok;
 
-	if (!u || !*u || !pw || !*pw) {
-		logmsg("client %s sent no credentials (.rdp: \"prompt for "
-		       "credentials:i:1\", \"enablecredsspsupport:i:0\")", ctx->rhost);
+	if (ctx->nla_user[0]) {
+		/* already authenticated by NLA + PAM (auth_logon) */
+		snprintf(user, sizeof user, "%s", ctx->nla_user);
+	} else if (freerdp_settings_get_bool(settings, FreeRDP_NlaSecurity)) {
+		/* NLA was negotiated but did not produce a user */
 		ctx->failed = true;
 		return FALSE;
+	} else {
+		if (!cfg.tls_login) {
+			logmsg("client %s: login without NLA refused (--nla-only)", ctx->rhost);
+			ctx->failed = true;
+			return FALSE;
+		}
+		if (!u || !*u || !pw || !*pw) {
+			logmsg("client %s sent no credentials", ctx->rhost);
+			ctx->failed = true;
+			return FALSE;
+		}
+		split_user(u, user, sizeof user);
+		if (!valid_username(user)) {
+			logmsg("client %s: invalid user name", ctx->rhost);
+			ctx->failed = true;
+			return FALSE;
+		}
+		if (!pam_check(user, pw, ctx->rhost)) {
+			ctx->failed = true;
+			return FALSE;
+		}
+		logmsg("user %s authenticated from %s", user, ctx->rhost);
 	}
-	split_user(u, user, sizeof user);
-	if (!valid_username(user)) {
-		logmsg("client %s: invalid user name", ctx->rhost);
-		ctx->failed = true;
-		return FALSE;
-	}
-	if (!pam_check(user, pw, ctx->rhost)) {
-		ctx->failed = true;
-		return FALSE;
-	}
-	logmsg("user %s authenticated from %s", user, ctx->rhost);
 
-	if (!token_create(user, token)) {
-		ctx->failed = true;
-		return FALSE;
+	{
+		struct login login = { 0 };
+		const char *cu = freerdp_settings_get_string(settings, FreeRDP_Username);
+		const char *cp = freerdp_settings_get_string(settings, FreeRDP_Password);
+
+		snprintf(login.user, sizeof login.user, "%s", user);
+		/* user name as the client sends it in NTLM (without domain) */
+		if (cu && *cu) {
+			const char *bs = strrchr(cu, '\\');
+
+			snprintf(login.client_user, sizeof login.client_user, "%s",
+				 bs ? bs + 1 : cu);
+		} else {
+			snprintf(login.client_user, sizeof login.client_user, "%s", user);
+		}
+		if (cp && *cp)
+			nt_hash_hex(cp, login.nthash);
+		if (!token_create(&login, token)) {
+			memset(&login, 0, sizeof login);
+			ctx->failed = true;
+			return FALSE;
+		}
+		memset(&login, 0, sizeof login);
 	}
 	/* FreeRDP writes the load balance info as "Cookie: msts=<value>\r\n",
 	 * which the client sends back verbatim as X.224 routing token */
@@ -695,7 +945,7 @@ auth_post_connect(freerdp_peer *peer)
 	redirection_set_flags(r, LB_LOAD_BALANCE_INFO | LB_USERNAME);
 	redirection_set_session_id(r, 0);
 	redirection_set_byte_option(r, LB_LOAD_BALANCE_INFO, (const BYTE *)lb, strlen(lb));
-	redirection_set_string_option(r, LB_USERNAME, u);
+	redirection_set_string_option(r, LB_USERNAME, u && *u ? u : user);
 	if (!redirection_settings_are_valid(r, &missing))
 		debugmsg("redirection settings incomplete (0x%x)", missing);
 	ok = peer->SendServerRedirection(peer, r);
@@ -757,6 +1007,13 @@ addr_to_string(const struct sockaddr_storage *ss, char *out, size_t size)
 	snprintf(out, size, "%s", buf);
 }
 
+/* NLA needs something to check the client's proof against */
+static bool
+nla_available(void)
+{
+	return cfg.nla && (access(cfg.sam, R_OK) == 0 || access(cfg.keytab, R_OK) == 0);
+}
+
 static void
 authenticate(int fd)
 {
@@ -791,8 +1048,14 @@ authenticate(int fd)
 		goto out;
 	}
 	freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, FALSE);
-	freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, TRUE);
-	freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, cfg.tls_login);
+	freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, nla_available());
+	if (nla_available()) {
+		if (access(cfg.sam, R_OK) == 0)
+			freerdp_settings_set_string(settings, FreeRDP_NtlmSamFile, cfg.sam);
+		if (access(cfg.keytab, R_OK) == 0)
+			freerdp_settings_set_string(settings, FreeRDP_KerberosKeytab, cfg.keytab);
+	}
 	freerdp_settings_set_uint32(settings, FreeRDP_OsMajorType, OSMAJORTYPE_UNIX);
 	freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
 	/* a RemoteApp client must see a RemoteApp capable server */
@@ -805,6 +1068,7 @@ authenticate(int fd)
 	freerdp_settings_set_uint32(settings, FreeRDP_RemoteAppNumIconCacheEntries, 12);
 	freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE);
 
+	peer->Logon = auth_logon;
 	peer->PostConnect = auth_post_connect;
 	peer->Activate = auth_activate;
 
@@ -905,11 +1169,13 @@ static void *
 connection_thread(void *data)
 {
 	int fd = (int)(intptr_t)data;
-	char token[TOKEN_HEX_LEN + 1], user[64];
+	char token[TOKEN_HEX_LEN + 1];
+	struct login login;
 
 	if (peek_token(fd, token)) {
-		if (token_take(token, user)) {
-			handoff(fd, user);
+		if (token_take(token, &login)) {
+			handoff(fd, &login);
+			memset(&login, 0, sizeof login);
 			return NULL;
 		}
 		logmsg("unknown or expired routing token, authenticating again");
@@ -1027,6 +1293,14 @@ usage(void)
 		"  -n, --name=DNSNAME     extra name for the generated certificate, e.g. the\n"
 		"                         external DNS name (repeatable; delete\n"
 		"                         /etc/weston-rail/tls.* to regenerate)\n"
+		"      --sam=FILE         NT hashes for NLA (/etc/weston-rail/ntlm.sam,\n"
+		"                         maintained with weston-rail-passwd)\n"
+		"      --keytab=FILE      Kerberos keytab for NLA in an AD domain\n"
+		"                         (/etc/weston-rail/krb5.keytab)\n"
+		"      --user-map=MODE    NLA user -> Linux account: plain (lars),\n"
+		"                         upn (lars@realm) or netbios (DOMAIN\\lars)\n"
+		"      --no-nla           do not offer NLA\n"
+		"      --nla-only         refuse logins without NLA\n"
 		"      --allow-root       allow sessions for root\n"
 		"  -v, --verbose\n", WESTON_BINARY);
 }
@@ -1042,6 +1316,11 @@ main(int argc, char *argv[])
 		{ "idle-exit", required_argument, NULL, 'i' },
 		{ "allow-root", no_argument, NULL, 'R' },
 		{ "name", required_argument, NULL, 'n' },
+		{ "sam", required_argument, NULL, 'S' },
+		{ "keytab", required_argument, NULL, 'K' },
+		{ "user-map", required_argument, NULL, 'M' },
+		{ "no-nla", no_argument, NULL, 'N' },
+		{ "nla-only", no_argument, NULL, 'O' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
@@ -1059,6 +1338,18 @@ main(int argc, char *argv[])
 		case 'w': cfg.weston = optarg; break;
 		case 'i': cfg.idle_exit_sec = atoi(optarg); break;
 		case 'R': cfg.allow_root = true; break;
+		case 'S': cfg.sam = optarg; break;
+		case 'K': cfg.keytab = optarg; break;
+		case 'M':
+			if (!strcmp(optarg, "upn"))
+				cfg.user_map = USER_MAP_UPN;
+			else if (!strcmp(optarg, "netbios"))
+				cfg.user_map = USER_MAP_NETBIOS;
+			else
+				cfg.user_map = USER_MAP_PLAIN;
+			break;
+		case 'N': cfg.nla = false; break;
+		case 'O': cfg.tls_login = false; break;
 		case 'n':
 			if (cfg.n_names < 16)
 				cfg.names[cfg.n_names++] = optarg;
@@ -1124,6 +1415,13 @@ main(int argc, char *argv[])
 	pthread_create(&tid, NULL, reaper_thread, NULL);
 	pthread_detach(tid);
 	logmsg("weston-rail-broker listening on port %d", cfg.port);
+	logmsg("NLA: %s%s%s; login without NLA: %s",
+	       !cfg.nla ? "off" : nla_available() ? "on" : "off (no NT hash file, no keytab)",
+	       nla_available() && access(cfg.sam, R_OK) == 0 ? ", NTLM via " : "",
+	       nla_available() && access(cfg.sam, R_OK) == 0 ? cfg.sam : "",
+	       cfg.tls_login ? "allowed" : "refused");
+	if (nla_available() && access(cfg.keytab, R_OK) == 0)
+		logmsg("NLA: Kerberos via %s", cfg.keytab);
 
 	for (;;) {
 		int fd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);

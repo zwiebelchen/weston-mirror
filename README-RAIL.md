@@ -26,6 +26,7 @@ einer Anwendung erscheint beim Client als eigenes lokales Fenster.
 | App-Liste an den Client publizieren (`rdpapplist`) | nicht verfügbar (Microsoft-eigener Kanal) |
 | Allowlist für startbare Programme | ja (`/etc/weston-rail/apps.conf`) |
 | Session pro User mit PAM-Login | ja, `weston-rail-broker` (siehe unten) |
+| NLA (Passwortabfrage in mstsc) | ja: NTLM über NT-Hash-Datei; Kerberos/AD vorbereitet, ungetestet |
 | Session pro User | geplant (siehe Roadmap) |
 
 ## Schnellstart
@@ -246,31 +247,69 @@ full address:s:SERVER:3389
 remoteapplicationmode:i:1
 remoteapplicationprogram:s:||firefox
 remoteapplicationname:s:Firefox
-username:s:BENUTZER
-enablecredsspsupport:i:0
-prompt for credentials:i:0
+enablecredsspsupport:i:1
+prompt for credentials:i:1
 authentication level:i:0
 disableconnectionsharing:i:1
 drivestoredirect:s:*
 redirectprinters:i:1
 ```
 
-Anmeldedaten: Solange der Broker kein NLA kann, fragt mstsc das Passwort
-nicht selbst ab (`prompt for credentials:i:1` verlangt CredSSP). mstsc
-schickt aber gespeicherte Zugangsdaten mit. Einmalig auf dem Client:
+### Anmeldung: NLA oder ohne NLA
+
+Der Broker kann beides. Mit **NLA** fragt mstsc wie bei Windows-RDS selbst
+nach Benutzer und Passwort (`enablecredsspsupport:i:1`,
+`prompt for credentials:i:1`, kein `username`). Ohne NLA schickt mstsc nur
+gespeicherte Zugangsdaten mit (`cmdkey`).
+
+NLA prüft die Anmeldung per NTLM oder Kerberos, bevor eine Session entsteht.
+Danach übergibt mstsc das Passwort, das der Broker zusätzlich per PAM prüft
+(gesperrte oder abgelaufene Konten kommen nicht durch). Woher der Server
+weiß, ob das Passwort stimmt:
+
+**Ohne Domäne – NT-Hash-Datei.** NTLM braucht den NT-Hash des Passworts, den
+Linux nicht hat. `weston-rail-passwd` legt ihn in `/etc/weston-rail/ntlm.sam`
+ab (nur root lesbar; ein NT-Hash ist so schützenswert wie ein Passwort):
+
+```bash
+sudo weston-rail-passwd lars     # prüft das Passwort gegen das Linux-Passwort
+sudo weston-rail-passwd -l       # eingetragene User
+sudo weston-rail-passwd -d lars  # entfernen
+```
+
+Automatisch eintragen bei jeder Linux-Anmeldung mit Passwort (SSH, Konsole,
+Anmeldung am Broker ohne NLA) – ans Ende von `/etc/pam.d/common-auth`:
 
 ```
-cmdkey /generic:TERMSRV/SERVERNAME /user:BENUTZER /pass:PASSWORT
+auth	optional	pam_exec.so expose_authtok quiet /usr/local/sbin/weston-rail-passwd --pam-sync
 ```
 
-`SERVERNAME` genau so, wie er in `full address` steht. Root-Anmeldungen sind
-gesperrt (`--allow-root`).
+Nach einem **Passwortwechsel** stimmt der NT-Hash nicht mehr, bis sich der
+User einmal anderweitig anmeldet oder `weston-rail-passwd` erneut läuft
+(`pam_exec` reicht beim Passwortwechsel das neue Passwort nicht weiter; ein
+eigenes PAM-Modul dafür ist geplant).
 
-`authentication level:i:0`: Die Verbindung ist per TLS verschlüsselt, mstsc
-prüft aber nicht, ob das Serverzertifikat vertrauenswürdig ist. Für den
-Betrieb besser ein vertrauenswürdiges Zertifikat einrichten (siehe unten) und
-`authentication level:i:2` setzen – mit `2` bricht mstsc bei einem
-unbekannten Zertifikat ab.
+**Mit Active Directory – Kerberos (noch nicht getestet).** Server in die
+Domäne aufnehmen (z. B. `realm join`), Dienstprinzipal
+`TERMSRV/<fqdn>` anlegen und dessen Schlüssel nach
+`/etc/weston-rail/krb5.keytab` (nur root) exportieren, z. B.:
+
+```bash
+sudo adcli update --service-name=TERMSRV
+sudo ktutil   # TERMSRV/*-Einträge aus /etc/krb5.keytab nach /etc/weston-rail/krb5.keytab
+```
+
+Dann meldet mstsc sich mit dem Windows-Konto an, verbunden über den
+vollqualifizierten Namen. Heißen die Linux-Konten `lars@zwiebelchen.org`
+(sssd mit vollqualifizierten Namen), dem Broker `--user-map=upn` mitgeben,
+bei `ZWIEBELCHEN\lars` `--user-map=netbios`. Die Verbindung nach der
+Umleitung läuft per NTLM mit dem Hash des gerade angemeldeten Users – die
+Domäne darf NTLM also nicht komplett verbieten.
+
+Beides lässt sich kombinieren: Kerberos für Domänen-Clients, die NT-Hash-Datei
+für alle anderen. Broker-Optionen: `--sam`, `--keytab`, `--user-map`,
+`--no-nla` (nur ohne NLA) und `--nla-only` (Anmeldung ohne NLA verbieten).
+Beim Start meldet der Broker im Log, welche Verfahren aktiv sind.
 
 ### Zertifikat
 

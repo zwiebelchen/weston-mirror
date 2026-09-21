@@ -2070,6 +2070,16 @@ rdp_peer_init(freerdp_peer *client, struct rdp_backend *b)
 	}
 #endif
 	settings->NlaSecurity = FALSE;
+	{
+		/* session broker: the broker leaves the user's own NT hash in
+		 * the private runtime directory, so the reconnect after the
+		 * redirection can use NLA as well */
+		const char *sam = getenv("WESTON_RDP_NLA_SAM");
+
+		if (sam && access(sam, R_OK) == 0 &&
+		    freerdp_settings_set_string(settings, FreeRDP_NtlmSamFile, sam))
+			settings->NlaSecurity = TRUE;
+	}
 
 	if (!client->Initialize(client)) {
 		rdp_debug_error(b, "peer initialization failed\n");

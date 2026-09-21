@@ -19,6 +19,15 @@ executable(
 	install_dir: join_paths(dir_prefix, get_option('sbindir')),
 )
 
+executable(
+	'weston-rail-passwd',
+	'weston-rail-passwd.c',
+	include_directories: common_inc,
+	dependencies: [ dep_wpr, dep_pam_broker ],
+	install: true,
+	install_dir: join_paths(dir_prefix, get_option('sbindir')),
+)
+
 install_data('weston-rail.pam',
 	rename: 'weston-rail',
 	install_dir: '/etc/pam.d')
