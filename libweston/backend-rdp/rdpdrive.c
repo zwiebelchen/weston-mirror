@@ -1239,11 +1239,25 @@ static int
 run_cmd(char *const argv[])
 {
 	extern char **environ;
+	static const char *const dirs[] = { "/usr/sbin", "/usr/bin", "/sbin", "/bin" };
+	char path[PATH_MAX];
 	pid_t pid;
-	int status = 0;
+	int status = 0, err;
+	size_t i;
 
-	if (posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ) != 0) {
-		weston_log("RDP printers: cannot run %s: %s\n", argv[0], strerror(errno));
+	/* lpadmin lives in /usr/sbin, which is not in a normal user's PATH
+	 * on Debian: try the usual locations explicitly */
+	err = ENOENT;
+	for (i = 0; i < sizeof dirs / sizeof dirs[0]; i++) {
+		snprintf(path, sizeof path, "%s/%s", dirs[i], argv[0]);
+		if (access(path, X_OK) != 0)
+			continue;
+		err = posix_spawn(&pid, path, NULL, NULL, argv, environ);
+		break;
+	}
+	if (err != 0) {
+		/* posix_spawn returns the error, it does not set errno */
+		weston_log("RDP printers: cannot run %s: %s\n", argv[0], strerror(err));
 		return -1;
 	}
 	while (waitpid(pid, &status, 0) < 0) {
@@ -1369,7 +1383,9 @@ queues_remove_stale(struct rdp_drives *d)
 	posix_spawn_file_actions_init(&fa);
 	posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
 	posix_spawn_file_actions_addclose(&fa, fds[0]);
-	if (posix_spawnp(&pid, "lpstat", &fa, NULL, argv, environ) != 0) {
+	if (posix_spawn(&pid, access("/usr/bin/lpstat", X_OK) == 0 ?
+				"/usr/bin/lpstat" : "/usr/sbin/lpstat",
+			&fa, NULL, argv, environ) != 0) {
 		posix_spawn_file_actions_destroy(&fa);
 		close(fds[0]);
 		close(fds[1]);

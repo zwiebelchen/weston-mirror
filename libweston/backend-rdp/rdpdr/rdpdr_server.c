@@ -3343,11 +3343,9 @@ static UINT rdpdr_server_drive_close_file_callback(RdpdrServerContext* context, 
 	           ", ioStatus=0x%" PRIx32 "",
 	           deviceId, completionId, ioStatus);
 
-	// padding 5 bytes
-	if (!Stream_CheckAndLogRequiredLengthWLog(context->priv->log, s, 5))
-		return ERROR_INVALID_DATA;
-
-	Stream_Seek(s, 5);
+	/* weston-mirror fix: DR_CLOSE_RSP padding is not always 5 bytes
+	 * (mstsc sends 4); it carries nothing, skip whatever is there */
+	Stream_Seek(s, MIN(Stream_GetRemainingLength(s), 5));
 
 	/* Invoke the close file completion routine. */
 	context->OnDriveCloseFileComplete(context, irp->CallbackData, ioStatus);
