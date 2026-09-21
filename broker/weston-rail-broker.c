@@ -26,6 +26,8 @@
 #include "config.h"
 
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netdb.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -83,6 +85,8 @@ static struct {
 	int idle_exit_sec;
 	bool allow_root;
 	bool verbose;
+	char *names[16];	/* --name: extra DNS names for the certificate */
+	int n_names;
 } cfg = {
 	.port = 3389,
 	.cert = "/etc/weston-rail/tls.crt",
@@ -916,18 +920,72 @@ connection_thread(void *data)
 
 /* ------------------------------------------------------------------ */
 
+static void
+san_add(char *san, size_t size, const char *type, const char *value)
+{
+	char entry[300];
+
+	if (!value || !*value)
+		return;
+	snprintf(entry, sizeof entry, "%s:%s", type, value);
+	/* no duplicates */
+	if (strstr(san, entry))
+		return;
+	if (*san)
+		strncat(san, ",", size - strlen(san) - 1);
+	strncat(san, entry, size - strlen(san) - 1);
+}
+
+/*
+ * Self-signed certificate valid for every name the server is reached by:
+ * host name, fully qualified name, all local IP addresses and the names
+ * given with --name (e.g. an external DNS name). mstsc checks the name it
+ * connected to against the subjectAltName entries.
+ */
 static bool
 ensure_certificate(void)
 {
-	char hostname[256] = "weston-rail", subj[300];
+	char hostname[256] = "weston-rail", subj[300], san[4096] = "", ext[4200];
+	struct addrinfo hints = { .ai_flags = AI_CANONNAME }, *ai = NULL;
+	struct ifaddrs *ifa = NULL, *i;
 	pid_t pid;
-	int status;
+	int status, k;
 
 	if (access(cfg.cert, R_OK) == 0 && access(cfg.key, R_OK) == 0)
 		return true;
+
 	gethostname(hostname, sizeof hostname - 1);
-	snprintf(subj, sizeof subj, "/CN=%s", hostname);
-	logmsg("creating a self-signed certificate %s", cfg.cert);
+	san_add(san, sizeof san, "DNS", hostname);
+	if (getaddrinfo(hostname, NULL, &hints, &ai) == 0 && ai && ai->ai_canonname)
+		san_add(san, sizeof san, "DNS", ai->ai_canonname);
+	if (ai)
+		freeaddrinfo(ai);
+	for (k = 0; k < cfg.n_names; k++)
+		san_add(san, sizeof san, "DNS", cfg.names[k]);
+	if (getifaddrs(&ifa) == 0) {
+		for (i = ifa; i; i = i->ifa_next) {
+			char buf[INET6_ADDRSTRLEN];
+
+			if (!i->ifa_addr)
+				continue;
+			if (i->ifa_addr->sa_family == AF_INET)
+				inet_ntop(AF_INET, &((struct sockaddr_in *)i->ifa_addr)->sin_addr,
+					  buf, sizeof buf);
+			else if (i->ifa_addr->sa_family == AF_INET6 &&
+				 !IN6_IS_ADDR_LINKLOCAL(&((struct sockaddr_in6 *)i->ifa_addr)->sin6_addr))
+				inet_ntop(AF_INET6, &((struct sockaddr_in6 *)i->ifa_addr)->sin6_addr,
+					  buf, sizeof buf);
+			else
+				continue;
+			san_add(san, sizeof san, "IP", buf);
+		}
+		freeifaddrs(ifa);
+	}
+
+	/* the name users type first, so that it shows up as the subject */
+	snprintf(subj, sizeof subj, "/CN=%s", cfg.n_names ? cfg.names[0] : hostname);
+	snprintf(ext, sizeof ext, "subjectAltName=%s", san);
+	logmsg("creating a self-signed certificate %s for %s", cfg.cert, san);
 	mkdir("/etc/weston-rail", 0755);
 	pid = fork();
 	if (pid == 0) {
@@ -940,6 +998,8 @@ ensure_certificate(void)
 		umask(077);
 		execlp("openssl", "openssl", "req", "-x509", "-newkey", "rsa:2048",
 		       "-nodes", "-days", "3650", "-subj", subj,
+		       "-addext", ext,
+		       "-addext", "extendedKeyUsage=serverAuth",
 		       "-keyout", cfg.key, "-out", cfg.cert, (char *)NULL);
 		_exit(127);
 	}
@@ -949,6 +1009,7 @@ ensure_certificate(void)
 		return false;
 	}
 	chmod(cfg.key, 0600);
+	chmod(cfg.cert, 0644);
 	return true;
 }
 
@@ -963,6 +1024,9 @@ usage(void)
 		"  -w, --weston=PATH      weston binary (%s)\n"
 		"  -i, --idle-exit=SEC    end a session this long after the last client\n"
 		"                         and the last application are gone (60)\n"
+		"  -n, --name=DNSNAME     extra name for the generated certificate, e.g. the\n"
+		"                         external DNS name (repeatable; delete\n"
+		"                         /etc/weston-rail/tls.* to regenerate)\n"
 		"      --allow-root       allow sessions for root\n"
 		"  -v, --verbose\n", WESTON_BINARY);
 }
@@ -977,6 +1041,7 @@ main(int argc, char *argv[])
 		{ "weston", required_argument, NULL, 'w' },
 		{ "idle-exit", required_argument, NULL, 'i' },
 		{ "allow-root", no_argument, NULL, 'R' },
+		{ "name", required_argument, NULL, 'n' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
@@ -986,7 +1051,7 @@ main(int argc, char *argv[])
 	int lfd, on = 1, off = 0, opt;
 	bool bound = false;
 
-	while ((opt = getopt_long(argc, argv, "p:c:k:w:i:vh", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "p:c:k:w:i:n:vh", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'p': cfg.port = atoi(optarg); break;
 		case 'c': cfg.cert = optarg; break;
@@ -994,6 +1059,10 @@ main(int argc, char *argv[])
 		case 'w': cfg.weston = optarg; break;
 		case 'i': cfg.idle_exit_sec = atoi(optarg); break;
 		case 'R': cfg.allow_root = true; break;
+		case 'n':
+			if (cfg.n_names < 16)
+				cfg.names[cfg.n_names++] = optarg;
+			break;
 		case 'v': cfg.verbose = true; break;
 		default: usage(); return opt == 'h' ? 0 : 2;
 		}

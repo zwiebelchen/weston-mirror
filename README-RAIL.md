@@ -246,21 +246,52 @@ full address:s:SERVER:3389
 remoteapplicationmode:i:1
 remoteapplicationprogram:s:||firefox
 remoteapplicationname:s:Firefox
+username:s:BENUTZER
 enablecredsspsupport:i:0
-prompt for credentials:i:1
-authentication level:i:0
+prompt for credentials:i:0
+authentication level:i:2
 disableconnectionsharing:i:1
 drivestoredirect:s:*
 redirectprinters:i:1
 ```
 
-`prompt for credentials:i:1` sorgt dafür, dass mstsc Benutzername und
-Passwort abfragt und mitschickt (ohne NLA). Root-Anmeldungen sind gesperrt
-(`--allow-root`).
+Anmeldedaten: Solange der Broker kein NLA kann, fragt mstsc das Passwort
+nicht selbst ab (`prompt for credentials:i:1` verlangt CredSSP). mstsc
+schickt aber gespeicherte Zugangsdaten mit. Einmalig auf dem Client:
 
-TLS: Beim ersten Start erzeugt der Broker `/etc/weston-rail/tls.crt/.key`
-(selbstsigniert). Jede Session bekommt eine Kopie, damit der Client nur ein
-Zertifikat sieht. Ein eigenes Zertifikat einfach dort ablegen.
+```
+cmdkey /generic:TERMSRV/SERVERNAME /user:BENUTZER /pass:PASSWORT
+```
+
+`SERVERNAME` genau so, wie er in `full address` steht. Root-Anmeldungen sind
+gesperrt (`--allow-root`).
+
+### Zertifikat
+
+Beim ersten Start erzeugt der Broker `/etc/weston-rail/tls.crt/.key`
+(selbstsigniert), gültig für Rechnername, vollqualifizierten Namen, alle
+IP-Adressen und die mit `--name` angegebenen Namen. Jede Session bekommt eine
+Kopie, damit der Client nur ein Zertifikat sieht.
+
+Externen DNS-Namen aufnehmen:
+
+```bash
+sudo systemctl edit weston-rail-broker
+#   [Service]
+#   Environment=BROKER_ARGS=--name=rdp.example.org
+sudo rm /etc/weston-rail/tls.crt /etc/weston-rail/tls.key
+sudo systemctl restart weston-rail-broker
+```
+
+Damit Windows dem selbstsignierten Zertifikat vertraut, `tls.crt` auf den
+Client kopieren und als Administrator importieren (oder per GPO verteilen):
+
+```
+certutil -addstore Root tls.crt
+```
+
+Alternativ ein Zertifikat einer eigenen oder öffentlichen CA (z. B. Let's
+Encrypt) als `tls.crt`/`tls.key` ablegen.
 
 Log einer Session: `/run/user/<uid>/weston-rail.log`.
 
