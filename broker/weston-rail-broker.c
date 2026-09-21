@@ -1004,6 +1004,14 @@ main(int argc, char *argv[])
 	}
 	signal(SIGPIPE, SIG_IGN);
 	setvbuf(stderr, NULL, _IOLBF, 0);
+
+	/* systemd starts services without HOME; FreeRDP derives its
+	 * configuration path from it and refuses to create a peer context */
+	if (!getenv("HOME") || !*getenv("HOME")) {
+		struct passwd *pw = getpwuid(geteuid());
+
+		setenv("HOME", pw && pw->pw_dir ? pw->pw_dir : "/root", 1);
+	}
 	winpr_InitializeSSL(WINPR_SSL_INIT_DEFAULT);
 
 	if (!ensure_certificate())

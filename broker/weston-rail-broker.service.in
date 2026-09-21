@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 ExecStart=@sbindir@/weston-rail-broker
+Environment=HOME=/root
 Restart=on-failure
 # sessions run in their own PAM/logind sessions; do not kill them when the
 # broker restarts
