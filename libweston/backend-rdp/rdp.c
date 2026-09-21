@@ -1682,8 +1682,16 @@ xf_input_synchronize_event(rdpInput *input, UINT32 flags)
 	return TRUE;
 }
 
+/* FreeRDP 3 passes the scancode as UINT8 (pKeyboardEvent); gcc 14 rejects
+ * the mismatching function pointer as an error. */
+#if FREERDP_VERSION_MAJOR >= 3
+#define RDP_KBD_CODE_TYPE UINT8
+#else
+#define RDP_KBD_CODE_TYPE UINT16
+#endif
+
 static BOOL
-xf_input_keyboard_event(rdpInput *input, UINT16 flags, UINT16 code)
+xf_input_keyboard_event(rdpInput *input, UINT16 flags, RDP_KBD_CODE_TYPE code)
 {
 	uint32_t scan_code, vk_code, full_code, keyboard_locale;
 	enum wl_keyboard_key_state keyState;
