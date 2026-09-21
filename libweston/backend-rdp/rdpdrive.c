@@ -33,8 +33,12 @@
  * rdpdr I/O request to the client via FreeRDP's asynchronous drive API;
  * the FUSE worker thread waits for the completion.
  *
- * Printers the client announces are only logged for now (name, driver,
- * flags) to decide on the print data format.
+ * Printers the client announces get a CUPS queue each ("rdp-<user>-<name>",
+ * created with lpadmin). The CUPS backend "rdpprint" (cups/) hands the jobs
+ * to this session through $XDG_RUNTIME_DIR/rdp-print-<pid>.sock, and they
+ * are written to the printer device on the client. Printers that announce
+ * XPSFORMAT get XPS (PDF -> XPS via Ghostscript, cups/rdpxps), all others
+ * generic PostScript. WESTON_RDP_PRINT_FORMAT=xps|ps overrides that.
  */
 
 #include "config.h"
@@ -53,6 +57,11 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <poll.h>
+#include <pwd.h>
+#include <spawn.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -82,6 +91,7 @@ void weston_rdpdr_server_context_free(RdpdrServerContext *context);
 #define ATTR_CACHE_TTL_MS 2000
 #define ATTR_CACHE_BUCKETS 256
 #define MAX_DRIVES 26
+#define MAX_PRINTERS 32
 
 #define FILETIME_UNIX_EPOCH_DIFF 11644473600LL
 
@@ -89,6 +99,15 @@ struct rdp_drive {
 	bool used;
 	UINT32 device_id;
 	char name[9];			/* PreferredDosName, NUL terminated */
+};
+
+struct rdp_printer {
+	bool used;
+	UINT32 device_id;
+	UINT32 flags;
+	char name[256];
+	char driver[256];
+	char queue[128];		/* CUPS queue name */
 };
 
 struct attr_entry {
@@ -130,6 +149,14 @@ struct rdp_drives {
 	bool shutdown;
 
 	struct attr_entry *cache[ATTR_CACHE_BUCKETS];
+
+	struct rdp_printer printers[MAX_PRINTERS];
+	char user[64];			/* sanitized, for queue names */
+	int spool_fd;
+	int spool_wake[2];
+	char *spool_path;
+	pthread_t spool_thread;
+	bool spool_running;
 
 	char *mount_dir;
 	struct fuse *fuse;
@@ -1194,6 +1221,176 @@ on_drive_delete(RdpdrServerContext *context, UINT32 device_id)
 	return CHANNEL_RC_OK;
 }
 
+/* ------------------------------------------------------------------ */
+/* printers                                                            */
+/* ------------------------------------------------------------------ */
+
+#ifndef WESTON_RAIL_DATADIR
+#define WESTON_RAIL_DATADIR "/usr/local/share/weston-rail"
+#endif
+
+#define RDPDR_PRINTER_ANNOUNCE_FLAG_DEFAULTPRINTER 0x02
+#define RDPDR_PRINTER_ANNOUNCE_FLAG_TSPRINTER 0x08
+#define RDPDR_PRINTER_ANNOUNCE_FLAG_XPSFORMAT 0x10
+
+/* Run a command and wait for it. weston's SIGCHLD handler may reap the
+ * child first; ECHILD then just means it has finished. */
+static int
+run_cmd(char *const argv[])
+{
+	extern char **environ;
+	pid_t pid;
+	int status = 0;
+
+	if (posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ) != 0) {
+		weston_log("RDP printers: cannot run %s: %s\n", argv[0], strerror(errno));
+		return -1;
+	}
+	while (waitpid(pid, &status, 0) < 0) {
+		if (errno == EINTR)
+			continue;
+		return 0;	/* ECHILD: reaped by weston, finished */
+	}
+	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static void
+sanitize(const char *in, char *out, size_t out_size)
+{
+	size_t i = 0;
+	bool last_us = false;
+
+	for (; *in && i + 1 < out_size; in++) {
+		unsigned char c = (unsigned char)*in;
+		bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			  (c >= '0' && c <= '9') || c == '-' || c == '.';
+
+		if (!ok) {
+			if (last_us || i == 0)
+				continue;
+			c = '_';
+			last_us = true;
+		} else {
+			last_us = false;
+		}
+		out[i++] = (char)c;
+	}
+	while (i > 0 && out[i - 1] == '_')
+		i--;
+	out[i] = '\0';
+}
+
+static const char *
+print_format_for(const struct rdp_printer *p)
+{
+	const char *env = getenv("WESTON_RDP_PRINT_FORMAT");
+
+	if (env && !strcmp(env, "xps"))
+		return "xps";
+	if (env && !strcmp(env, "ps"))
+		return "ps";
+	return (p->flags & RDPDR_PRINTER_ANNOUNCE_FLAG_XPSFORMAT) ? "xps" : "ps";
+}
+
+struct queue_job {
+	struct rdp_printer printer;	/* copy, the thread may outlive the session */
+	char uri[PATH_MAX + 64];
+	char description[600];
+	char location[300];
+	char user[64];
+};
+
+static void *
+queue_create_thread(void *data)
+{
+	struct queue_job *job = data;
+	char allow[80];
+	char ppd[PATH_MAX];
+	bool xps = !strcmp(print_format_for(&job->printer), "xps");
+	int rc;
+
+	snprintf(allow, sizeof allow, "allow:%s", job->user);
+	snprintf(ppd, sizeof ppd, "%s/rdp-xps.ppd", WESTON_RAIL_DATADIR);
+	{
+		char *argv[] = {
+			"lpadmin", "-p", job->printer.queue, "-E",
+			"-v", job->uri,
+			"-D", job->description,
+			"-L", job->location,
+			"-o", "printer-is-shared=false",
+			"-u", allow,
+			xps ? "-P" : "-m",
+			xps ? ppd : "drv:///sample.drv/generic.ppd",
+			NULL
+		};
+		rc = run_cmd(argv);
+	}
+	if (rc != 0) {
+		weston_log("RDP printers: lpadmin failed for '%s' (exit %d). Is CUPS "
+			   "running and is the user in the group lpadmin?\n",
+			   job->printer.name, rc);
+	} else {
+		weston_log("RDP printers: queue '%s' for '%s' (%s)\n",
+			   job->printer.queue, job->printer.name, xps ? "XPS" : "PostScript");
+		if (job->printer.flags & RDPDR_PRINTER_ANNOUNCE_FLAG_DEFAULTPRINTER) {
+			char *argv[] = { "lpoptions", "-d", job->printer.queue, NULL };
+
+			run_cmd(argv);
+		}
+	}
+	free(job);
+	return NULL;
+}
+
+static void
+queue_remove(const char *queue)
+{
+	char *argv[] = { "lpadmin", "-x", (char *)queue, NULL };
+
+	if (run_cmd(argv) == 0)
+		weston_log("RDP printers: queue '%s' removed\n", queue);
+}
+
+/* remove queues of this user left over from a crashed session */
+static void
+queues_remove_stale(struct rdp_drives *d)
+{
+	char prefix[80], line[512];
+	FILE *f;
+	int fds[2];
+	pid_t pid;
+	extern char **environ;
+	char *argv[] = { "lpstat", "-e", NULL };
+	posix_spawn_file_actions_t fa;
+
+	snprintf(prefix, sizeof prefix, "rdp-%s-", d->user);
+	if (pipe(fds) < 0)
+		return;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+	posix_spawn_file_actions_addclose(&fa, fds[0]);
+	if (posix_spawnp(&pid, "lpstat", &fa, NULL, argv, environ) != 0) {
+		posix_spawn_file_actions_destroy(&fa);
+		close(fds[0]);
+		close(fds[1]);
+		return;
+	}
+	posix_spawn_file_actions_destroy(&fa);
+	close(fds[1]);
+	f = fdopen(fds[0], "r");
+	if (!f) {
+		close(fds[0]);
+		return;
+	}
+	while (fgets(line, sizeof line, f)) {
+		line[strcspn(line, " \r\n")] = '\0';
+		if (!strncmp(line, prefix, strlen(prefix)))
+			queue_remove(line);
+	}
+	fclose(f);
+	waitpid(pid, NULL, 0);
+}
+
 /* MS-RDPEPC 2.2.2.1 DR_PRN_DEVICE_ANNOUNCE device data */
 static void
 utf16_field_to_utf8(const BYTE *p, UINT32 bytes, char *out, size_t out_size)
@@ -1215,7 +1412,11 @@ on_printer_create(RdpdrServerContext *context, const RdpdrDevice *device)
 	const BYTE *p = device->DeviceData;
 	UINT32 len = device->DeviceDataLength;
 	UINT32 flags, pnp_len, drv_len, name_len;
-	char driver[256], name[256];
+	struct rdp_printer pr = { 0 };
+	struct queue_job *job;
+	char base[128];
+	pthread_t tid;
+	int i, slot = -1;
 
 	if (!p || len < 24) {
 		weston_log("RDP rdpdr: printer (device %u) without data\n",
@@ -1234,24 +1435,319 @@ on_printer_create(RdpdrServerContext *context, const RdpdrDevice *device)
 			   device->DeviceId);
 		return CHANNEL_RC_OK;
 	}
-	utf16_field_to_utf8(p + 24 + pnp_len, drv_len, driver, sizeof driver);
-	utf16_field_to_utf8(p + 24 + pnp_len + drv_len, name_len, name, sizeof name);
+	pr.used = true;
+	pr.device_id = device->DeviceId;
+	pr.flags = flags;
+	utf16_field_to_utf8(p + 24 + pnp_len, drv_len, pr.driver, sizeof pr.driver);
+	utf16_field_to_utf8(p + 24 + pnp_len + drv_len, name_len, pr.name, sizeof pr.name);
 
 	weston_log("RDP rdpdr: printer '%s' driver '%s' (device %u) flags 0x%x%s%s%s from '%s'\n",
-		   name, driver, device->DeviceId, flags,
-		   (flags & 0x02) ? " DEFAULT" : "",
-		   (flags & 0x10) ? " XPSFORMAT" : "",
-		   (flags & 0x08) ? " TSPRINTER" : "",
+		   pr.name, pr.driver, device->DeviceId, flags,
+		   (flags & RDPDR_PRINTER_ANNOUNCE_FLAG_DEFAULTPRINTER) ? " DEFAULT" : "",
+		   (flags & RDPDR_PRINTER_ANNOUNCE_FLAG_XPSFORMAT) ? " XPSFORMAT" : "",
+		   (flags & RDPDR_PRINTER_ANNOUNCE_FLAG_TSPRINTER) ? " TSPRINTER" : "",
 		   d->client_name);
+
+	if (!d->spool_path)
+		return CHANNEL_RC_OK;	/* printing disabled / not available */
+
+	sanitize(pr.name, base, sizeof base);
+	if (!base[0])
+		snprintf(base, sizeof base, "printer%u", pr.device_id);
+
+	pthread_mutex_lock(&d->lock);
+	for (i = 0; i < MAX_PRINTERS; i++) {
+		if (!d->printers[i].used && slot < 0)
+			slot = i;
+	}
+	if (slot >= 0) {
+		snprintf(pr.queue, sizeof pr.queue, "rdp-%s-%s", d->user, base);
+		/* keep names unique if two client printers sanitize alike */
+		for (i = 0; i < MAX_PRINTERS; i++) {
+			if (d->printers[i].used && !strcmp(d->printers[i].queue, pr.queue)) {
+				snprintf(pr.queue, sizeof pr.queue, "rdp-%s-%s-%u",
+					 d->user, base, pr.device_id);
+				break;
+			}
+		}
+		d->printers[slot] = pr;
+	}
+	pthread_mutex_unlock(&d->lock);
+	if (slot < 0)
+		return CHANNEL_RC_OK;
+
+	job = xzalloc(sizeof *job);
+	job->printer = pr;
+	snprintf(job->uri, sizeof job->uri, "rdpprint:%s?device=%u",
+		 d->spool_path, pr.device_id);
+	snprintf(job->description, sizeof job->description, "%s (%s)",
+		 pr.name, d->client_name[0] ? d->client_name : "RDP");
+	snprintf(job->location, sizeof job->location, "RDP-Client %s", d->client_name);
+	snprintf(job->user, sizeof job->user, "%s", d->user);
+	if (pthread_create(&tid, NULL, queue_create_thread, job) == 0)
+		pthread_detach(tid);
+	else
+		free(job);
 	return CHANNEL_RC_OK;
 }
 
 static UINT
 on_printer_delete(RdpdrServerContext *context, UINT32 device_id)
 {
-	(void)context;
+	struct rdp_drives *d = drives_from_context(context);
+	char queue[128] = "";
+	int i;
+
+	pthread_mutex_lock(&d->lock);
+	for (i = 0; i < MAX_PRINTERS; i++) {
+		if (d->printers[i].used && d->printers[i].device_id == device_id) {
+			snprintf(queue, sizeof queue, "%s", d->printers[i].queue);
+			d->printers[i].used = false;
+		}
+	}
+	pthread_mutex_unlock(&d->lock);
 	weston_log("RDP rdpdr: printer (device %u) removed\n", device_id);
+	if (queue[0])
+		queue_remove(queue);
 	return CHANNEL_RC_OK;
+}
+
+/* ---- spool socket: CUPS backend -> session -> client printer ---- */
+
+static int
+read_line(int fd, char *buf, size_t size)
+{
+	size_t i = 0;
+
+	while (i + 1 < size) {
+		ssize_t n = read(fd, buf + i, 1);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			return -1;
+		if (buf[i] == '\n') {
+			buf[i] = '\0';
+			return 0;
+		}
+		i++;
+	}
+	return -1;
+}
+
+static void
+spool_reply(int fd, const char *msg)
+{
+	ssize_t n = write(fd, msg, strlen(msg));
+
+	(void)n;
+}
+
+static int
+print_send_chunk(struct rdp_drives *d, UINT32 dev, UINT32 file_id,
+		 const char *buf, UINT32 len, UINT32 offset)
+{
+	struct drive_wait *w = wait_new(d);
+	int rc;
+
+	rc = wait_for(d, w, d->rdpdr->DriveWriteFile(d->rdpdr, w, dev, file_id,
+						       buf, len, offset));
+	if (rc == 0 && w->io_status != STATUS_SUCCESS)
+		rc = -nt_to_errno(w->io_status);
+	wait_put(w);
+	return rc;
+}
+
+static void
+spool_handle(struct rdp_drives *d, int fd)
+{
+	char line[128], name[256] = "";
+	unsigned long device;
+	struct ucred cred;
+	socklen_t cl = sizeof cred;
+	UINT32 file_id = 0, offset = 0;
+	bool known = false;
+	char *buf;
+	int i, rc;
+
+	if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &cl) < 0 ||
+	    (cred.uid != 0 && cred.uid != getuid())) {
+		spool_reply(fd, "ERR not allowed\n");
+		return;
+	}
+	if (read_line(fd, line, sizeof line) < 0 ||
+	    sscanf(line, "RDPPRINT 1 %lu", &device) != 1) {
+		spool_reply(fd, "ERR bad request\n");
+		return;
+	}
+
+	pthread_mutex_lock(&d->lock);
+	for (i = 0; i < MAX_PRINTERS; i++) {
+		if (d->printers[i].used && d->printers[i].device_id == device) {
+			known = true;
+			snprintf(name, sizeof name, "%s", d->printers[i].name);
+		}
+	}
+	pthread_mutex_unlock(&d->lock);
+	if (!known) {
+		spool_reply(fd, "ERR printer not connected\n");
+		return;
+	}
+
+	rc = drv_open(d, (UINT32)device, "", GENERIC_WRITE, FILE_OPEN_IF, &file_id);
+	if (rc < 0) {
+		weston_log("RDP printers: cannot open '%s' on the client (%d)\n", name, rc);
+		spool_reply(fd, "ERR client refused the print job\n");
+		return;
+	}
+
+	buf = xmalloc(32768);
+	for (;;) {
+		ssize_t n = read(fd, buf, 32768);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0) {
+			rc = n < 0 ? -EIO : 0;
+			break;
+		}
+		rc = print_send_chunk(d, (UINT32)device, file_id, buf, (UINT32)n, offset);
+		if (rc < 0)
+			break;
+		offset += (UINT32)n;
+	}
+	free(buf);
+	drv_close(d, (UINT32)device, file_id);
+
+	if (rc < 0) {
+		weston_log("RDP printers: job for '%s' failed after %u bytes (%d)\n",
+			   name, offset, rc);
+		spool_reply(fd, "ERR transfer to the client failed\n");
+	} else {
+		weston_log("RDP printers: job for '%s' sent (%u bytes)\n", name, offset);
+		spool_reply(fd, "OK\n");
+	}
+}
+
+static void *
+spool_thread_main(void *data)
+{
+	struct rdp_drives *d = data;
+
+	for (;;) {
+		struct pollfd pfd[2] = {
+			{ .fd = d->spool_fd, .events = POLLIN },
+			{ .fd = d->spool_wake[0], .events = POLLIN },
+		};
+		int fd;
+
+		if (poll(pfd, 2, -1) < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (pfd[1].revents)
+			break;
+		if (!(pfd[0].revents & POLLIN))
+			continue;
+		fd = accept4(d->spool_fd, NULL, NULL, SOCK_CLOEXEC);
+		if (fd < 0)
+			continue;
+		spool_handle(d, fd);	/* one job at a time */
+		close(fd);
+	}
+	return NULL;
+}
+
+static bool
+spool_start(struct rdp_drives *d)
+{
+	const char *rt = getenv("XDG_RUNTIME_DIR");
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	struct passwd *pw = getpwuid(getuid());
+
+	if (getenv("WESTON_RDP_DISABLE_PRINTERS")) {
+		weston_log("RDP printers: disabled by WESTON_RDP_DISABLE_PRINTERS\n");
+		return false;
+	}
+	if (!rt || !*rt || !pw)
+		return false;
+	sanitize(pw->pw_name, d->user, sizeof d->user);
+
+	if (asprintf(&d->spool_path, "%s/rdp-print-%d.sock", rt, (int)getpid()) < 0) {
+		d->spool_path = NULL;
+		return false;
+	}
+	if (strlen(d->spool_path) >= sizeof addr.sun_path)
+		goto fail;
+	strcpy(addr.sun_path, d->spool_path);
+	unlink(d->spool_path);
+
+	d->spool_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (d->spool_fd < 0)
+		goto fail;
+	if (bind(d->spool_fd, (struct sockaddr *)&addr, sizeof addr) < 0 ||
+	    listen(d->spool_fd, 4) < 0) {
+		weston_log("RDP printers: cannot listen on %s: %s\n",
+			   d->spool_path, strerror(errno));
+		close(d->spool_fd);
+		goto fail;
+	}
+	chmod(d->spool_path, 0600);
+	if (pipe2(d->spool_wake, O_CLOEXEC) < 0) {
+		close(d->spool_fd);
+		unlink(d->spool_path);
+		goto fail;
+	}
+	if (pthread_create(&d->spool_thread, NULL, spool_thread_main, d) != 0) {
+		close(d->spool_fd);
+		close(d->spool_wake[0]);
+		close(d->spool_wake[1]);
+		unlink(d->spool_path);
+		goto fail;
+	}
+	d->spool_running = true;
+	queues_remove_stale(d);
+	return true;
+
+fail:
+	free(d->spool_path);
+	d->spool_path = NULL;
+	return false;
+}
+
+static void
+spool_stop(struct rdp_drives *d)
+{
+	char queues[MAX_PRINTERS][128];
+	int i, n = 0;
+
+	if (d->spool_running) {
+		ssize_t w = write(d->spool_wake[1], "x", 1);
+
+		(void)w;
+		pthread_join(d->spool_thread, NULL);
+		close(d->spool_fd);
+		close(d->spool_wake[0]);
+		close(d->spool_wake[1]);
+		unlink(d->spool_path);
+		d->spool_running = false;
+	}
+
+	pthread_mutex_lock(&d->lock);
+	for (i = 0; i < MAX_PRINTERS; i++) {
+		if (d->printers[i].used) {
+			snprintf(queues[n++], sizeof queues[0], "%s", d->printers[i].queue);
+			d->printers[i].used = false;
+		}
+	}
+	pthread_mutex_unlock(&d->lock);
+	/* synchronous, so a following session cannot race with the removal */
+	for (i = 0; i < n; i++)
+		queue_remove(queues[i]);
+
+	free(d->spool_path);
+	d->spool_path = NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1266,10 +1762,6 @@ rdp_drives_init(RdpPeerContext *peer_ctx)
 
 	if (peer_ctx->drives || !peer_ctx->vcm)
 		return;
-	if (getenv("WESTON_RDP_DISABLE_DRIVES")) {
-		weston_log("RDP drives: disabled by WESTON_RDP_DISABLE_DRIVES\n");
-		return;
-	}
 
 	rdpdr = weston_rdpdr_server_context_new(peer_ctx->vcm);
 	if (!rdpdr)
@@ -1300,9 +1792,15 @@ rdp_drives_init(RdpPeerContext *peer_ctx)
 	rdpdr->OnDriveRenameFileComplete = on_simple_complete;
 
 	peer_ctx->drives = d;
+	d->spool_fd = -1;
 
-	if (!drives_mount(d))
-		weston_log("RDP drives: drive redirection unavailable, printers are still logged\n");
+	if (!spool_start(d))
+		weston_log("RDP printers: printing unavailable\n");
+
+	if (getenv("WESTON_RDP_DISABLE_DRIVES"))
+		weston_log("RDP drives: disabled by WESTON_RDP_DISABLE_DRIVES\n");
+	else if (!drives_mount(d))
+		weston_log("RDP drives: drive redirection unavailable\n");
 
 	if (rdpdr->Start(rdpdr) != CHANNEL_RC_OK) {
 		/* the client did not join the rdpdr channel (nothing shared) */
@@ -1341,6 +1839,9 @@ rdp_drives_destroy(RdpPeerContext *peer_ctx)
 		d->fuse = NULL;
 		weston_log("RDP drives: %s unmounted\n", d->mount_dir);
 	}
+
+	/* running print job is cancelled with the waiters above */
+	spool_stop(d);
 
 	/* no completion callbacks after this */
 	d->rdpdr->Stop(d->rdpdr);

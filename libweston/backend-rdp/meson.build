@@ -63,6 +63,25 @@ else
 	message('fuse3 not found: RDP drive redirection disabled')
 endif
 
+# printing to RDP client printers: CUPS backend, filter, PPD, MIME type
+dir_weston_rail_data = join_paths(dir_data, 'weston-rail')
+config_h.set_quoted('WESTON_RAIL_DATADIR', dir_weston_rail_data)
+dir_cups_serverbin = get_option('cups-serverbin')
+dir_cups_datadir = get_option('cups-datadir')
+executable(
+	'rdpprint',
+	'cups/rdpprint-backend.c',
+	install: true,
+	install_dir: join_paths(dir_cups_serverbin, 'backend'),
+	install_mode: 'rwx------',
+)
+install_data('cups/rdpxps',
+	install_dir: join_paths(dir_cups_serverbin, 'filter'),
+	install_mode: 'rwxr-xr-x')
+install_data('cups/weston-rail.types',
+	install_dir: join_paths(dir_cups_datadir, 'mime'))
+install_data('cups/rdp-xps.ppd', install_dir: dir_weston_rail_data)
+
 dep_openssl = dependency('openssl', version: '>= 1.1.1', required: false)
 if dep_openssl.found()
 	config_h.set('HAVE_OPENSSL', '1')

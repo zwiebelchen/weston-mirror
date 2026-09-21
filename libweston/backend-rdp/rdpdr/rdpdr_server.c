@@ -9,7 +9,7 @@
  *    non-empty write)
  *  - directory listing pattern "*" instead of "*.*"
  *  - completion ids handed out atomically (requests come from several threads)
- *  - optional padding bytes accepted
+ *  - optional padding / Information bytes accepted
  *  - one PDU per channel message (leftover padding was parsed as a PDU)
  *  - client capability evaluation fixed (upstream mapped capability types
  *    onto device type bits and disabled drives before seeing their cap)
@@ -2715,11 +2715,14 @@ static UINT rdpdr_server_drive_create_directory_callback1(RdpdrServerContext* co
 		return CHANNEL_RC_OK;
 	}
 
-	if (!Stream_CheckAndLogRequiredLengthWLog(context->priv->log, s, 5))
+	/* weston-mirror fix: Information is optional (printers answer
+	 * with the FileId only) */
+	if (!Stream_CheckAndLogRequiredLengthWLog(context->priv->log, s, 4))
 		return ERROR_INVALID_DATA;
 
 	const uint32_t fileId = Stream_Get_UINT32(s);    /* FileId (4 bytes) */
-	const uint8_t information = Stream_Get_UINT8(s); /* Information (1 byte) */
+	const uint8_t information =
+	    (Stream_GetRemainingLength(s) >= 1) ? Stream_Get_UINT8(s) : 0; /* Information (1 byte) */
 	WLog_Print(context->priv->log, WLOG_DEBUG, "fileId [0x%08" PRIx32 "], information %s", fileId,
 	           fileInformation2str(information));
 
@@ -2836,11 +2839,14 @@ static UINT rdpdr_server_drive_delete_directory_callback1(RdpdrServerContext* co
 		return CHANNEL_RC_OK;
 	}
 
-	if (!Stream_CheckAndLogRequiredLengthWLog(context->priv->log, s, 5))
+	/* weston-mirror fix: Information is optional (printers answer
+	 * with the FileId only) */
+	if (!Stream_CheckAndLogRequiredLengthWLog(context->priv->log, s, 4))
 		return ERROR_INVALID_DATA;
 
 	const uint32_t fileId = Stream_Get_UINT32(s);    /* FileId (4 bytes) */
-	const uint8_t information = Stream_Get_UINT8(s); /* Information (1 byte) */
+	const uint8_t information =
+	    (Stream_GetRemainingLength(s) >= 1) ? Stream_Get_UINT8(s) : 0; /* Information (1 byte) */
 	WLog_Print(context->priv->log, WLOG_DEBUG, "fileId [0x%08" PRIx32 "], information %s", fileId,
 	           fileInformation2str(information));
 
@@ -3091,11 +3097,14 @@ static UINT rdpdr_server_drive_open_file_callback(RdpdrServerContext* context, w
 	           ", ioStatus=0x%" PRIx32 "",
 	           deviceId, completionId, ioStatus);
 
-	if (!Stream_CheckAndLogRequiredLengthWLog(context->priv->log, s, 5))
+	/* weston-mirror fix: Information is optional (printers answer
+	 * with the FileId only) */
+	if (!Stream_CheckAndLogRequiredLengthWLog(context->priv->log, s, 4))
 		return ERROR_INVALID_DATA;
 
 	const uint32_t fileId = Stream_Get_UINT32(s);    /* FileId (4 bytes) */
-	const uint8_t information = Stream_Get_UINT8(s); /* Information (1 byte) */
+	const uint8_t information =
+	    (Stream_GetRemainingLength(s) >= 1) ? Stream_Get_UINT8(s) : 0; /* Information (1 byte) */
 	WLog_Print(context->priv->log, WLOG_DEBUG, "fileId [0x%08" PRIx32 "], information %s", fileId,
 	           fileInformation2str(information));
 
@@ -3439,11 +3448,14 @@ static UINT rdpdr_server_drive_delete_file_callback1(RdpdrServerContext* context
 		return CHANNEL_RC_OK;
 	}
 
-	if (!Stream_CheckAndLogRequiredLengthWLog(context->priv->log, s, 5))
+	/* weston-mirror fix: Information is optional (printers answer
+	 * with the FileId only) */
+	if (!Stream_CheckAndLogRequiredLengthWLog(context->priv->log, s, 4))
 		return ERROR_INVALID_DATA;
 
 	const uint32_t fileId = Stream_Get_UINT32(s);    /* FileId (4 bytes) */
-	const uint8_t information = Stream_Get_UINT8(s); /* Information (1 byte) */
+	const uint8_t information =
+	    (Stream_GetRemainingLength(s) >= 1) ? Stream_Get_UINT8(s) : 0; /* Information (1 byte) */
 
 	WLog_Print(context->priv->log, WLOG_DEBUG, "fileId [0x%08" PRIx32 "], information %s", fileId,
 	           fileInformation2str(information));
@@ -3601,11 +3613,14 @@ static UINT rdpdr_server_drive_rename_file_callback1(RdpdrServerContext* context
 		return CHANNEL_RC_OK;
 	}
 
-	if (!Stream_CheckAndLogRequiredLengthWLog(context->priv->log, s, 5))
+	/* weston-mirror fix: Information is optional (printers answer
+	 * with the FileId only) */
+	if (!Stream_CheckAndLogRequiredLengthWLog(context->priv->log, s, 4))
 		return ERROR_INVALID_DATA;
 
 	const uint32_t fileId = Stream_Get_UINT32(s);    /* FileId (4 bytes) */
-	const uint8_t information = Stream_Get_UINT8(s); /* Information (1 byte) */
+	const uint8_t information =
+	    (Stream_GetRemainingLength(s) >= 1) ? Stream_Get_UINT8(s) : 0; /* Information (1 byte) */
 	WLog_Print(context->priv->log, WLOG_DEBUG, "fileId [0x%08" PRIx32 "], information %s", fileId,
 	           fileInformation2str(information));
 

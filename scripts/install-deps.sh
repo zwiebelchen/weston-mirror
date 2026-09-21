@@ -53,6 +53,10 @@ BUILD_LIBS=(
 RUNTIME=(
 	xwayland                # X11-Anwendungen als RemoteApp
 	fuse3                   # fusermount3 fuer die Laufwerksumleitung
+	cups                    # Druckerumleitung: Warteschlangen je Client-Drucker
+	cups-client             # lpadmin, lpstat, lpoptions
+	cups-filters            # Umwandlung der Druckdaten nach PDF/PostScript
+	ghostscript             # PDF -> XPS (xpswrite) fuer mstsc-Drucker
 	openssl
 )
 

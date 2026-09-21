@@ -20,7 +20,7 @@ einer Anwendung erscheint beim Client als eigenes lokales Fenster.
 | Abmelden, wenn die letzte App geschlossen wird | ja, nach 5 s |
 | Neue Verbindung übernimmt die laufende Session | ja |
 | Laufwerksumleitung (Client-Laufwerke im Server) | ja, über FUSE (siehe unten) |
-| Druckerumleitung | Drucker werden erkannt und protokolliert, Drucken noch nicht |
+| Druckerumleitung | ja, eine CUPS-Warteschlange je Client-Drucker (siehe unten) |
 | RemoteApp mit `xfreerdp3` (Linux-Client) | startet, Fensterinhalt bleibt schwarz (Client-Problem) |
 | Mikrofon-Weiterleitung (audin) | unter FreeRDP 3 deaktiviert |
 | App-Liste an den Client publizieren (`rdpapplist`) | nicht verfügbar (Microsoft-eigener Kanal) |
@@ -56,6 +56,7 @@ Benötigte Pakete (Stand Debian 13):
 - **Sonstiges:** `libdrm-dev libpam0g-dev libssl-dev libglib2.0-dev`
 - **RDP:** `freerdp3-dev libwinpr3-dev`
 - **Laufwerke:** `libfuse3-dev fuse3`
+- **Drucken:** `cups cups-client cups-filters ghostscript`
 - **Xwayland (X11-Apps):** `libx11-dev libxcb1-dev libxcb-composite0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev`
 - **Laufzeit:** `xwayland openssl`
 
@@ -152,6 +153,33 @@ Aktuell **nicht** im offenen Netz betreiben:
 - Der Client bestimmt, **welches Programm** gestartet wird. Jeder absolute Pfad
   ist erlaubt, also auch ein Terminal. Eine Allowlist ist geplant.
 - Nur eine RDP-Verbindung pro Weston-Instanz.
+
+## Druckerumleitung
+
+Für jeden Drucker, den der Client meldet (`redirectprinters:i:1`), legt die
+Session eine CUPS-Warteschlange an: `rdp-<user>-<Druckername>`, Beschreibung
+„<Druckername> (<Client>)“. Sie erscheint in jedem Druckdialog (GTK, Firefox,
+LibreOffice, `lp`). Der Standarddrucker des Clients wird Standard des Users.
+Beim Trennen werden die Warteschlangen wieder entfernt.
+
+Druckweg: Anwendung → CUPS (PDF) → Filter `rdpxps` (Ghostscript `xpswrite`)
+→ Backend `rdpprint` → Session → rdpdr → Client. Drucker, die mstsc mit
+`XPSFORMAT` meldet, bekommen XPS und werden vom Windows-Treiber des Clients
+gedruckt – unabhängig vom Druckermodell. Andere Drucker bekommen generisches
+PostScript. Erzwingen mit `WESTON_RDP_PRINT_FORMAT=xps` bzw. `ps`,
+abschalten mit `WESTON_RDP_DISABLE_PRINTERS=1`.
+
+Einmalig einrichten:
+
+```bash
+sudo usermod -aG lpadmin $USER     # darf Warteschlangen anlegen; danach neu anmelden
+sudo systemctl restart cups        # nach ./build.sh install (neuer MIME-Typ)
+```
+
+`./build.sh install` legt das Backend nach `/usr/lib/cups/backend/rdpprint`
+(root, 0700 – es muss in das private Laufzeitverzeichnis des Users) und den
+Filter nach `/usr/lib/cups/filter/rdpxps`. Das Backend liefert nur an einen
+Socket in `/run/user/<uid>` des Auftrags-Users, der diesem User gehört.
 
 ## Roadmap: Session pro User
 
