@@ -1302,11 +1302,30 @@ xf_peer_activate(freerdp_peer* client)
 		settings->CompressionEnabled = FALSE;
 	}
 
-	/* in RAIL mode, only one peer per backend can be activated */
+	/*
+	 * In RAIL mode only one peer per backend can be active. A new
+	 * connection takes the session over, like reconnecting to a
+	 * disconnected session on Windows: the previous client is logged off,
+	 * the running applications stay alive and their windows are sent to
+	 * the new client (rdp_rail_sync_window_status()). This covers mstsc
+	 * opening a second connection for another RemoteApp as well as a
+	 * client reconnecting after a network drop while the server still
+	 * holds the stale connection.
+	 */
 	if (settings->RemoteApplicationMode) {
 		if (b->rdp_peer != client) {
-			rdp_debug_error(b, "Another RAIL connection active, only one connection is allowed.\n");
-			return FALSE;
+			freerdp_peer *previous = b->rdp_peer;
+
+			if (previous) {
+				weston_log("RDP RAIL: new connection takes over the session, "
+					   "disconnecting the previous client\n");
+				previous->Close(previous);
+				previous->Disconnect(previous);
+				/* frees the RAIL state and clears b->rdp_peer */
+				freerdp_peer_context_free(previous);
+				freerdp_peer_free(previous);
+			}
+			b->rdp_peer = client;
 		}
 
 		if (!settings->HiDefRemoteApp) {
