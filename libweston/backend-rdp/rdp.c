@@ -53,6 +53,10 @@
 #endif
 
 #if FREERDP_VERSION_MAJOR >= 3
+/* MS-RDPERP 2.2.1.1.2 wndSupportLevel; FreeRDP keeps these in a private header */
+#ifndef WINDOW_LEVEL_SUPPORTED_EX
+#define WINDOW_LEVEL_SUPPORTED_EX 0x00000002
+#endif
 #include <freerdp/crypto/certificate.h>
 #include <freerdp/crypto/privatekey.h>
 #endif
@@ -2018,6 +2022,18 @@ rdp_peer_init(freerdp_peer *client, struct rdp_backend *b)
 		RAIL_LEVEL_LANGUAGE_IME_SYNC_SUPPORTED |
 		RAIL_LEVEL_SERVER_TO_CLIENT_IME_SYNC_SUPPORTED |
 		RAIL_LEVEL_HANDSHAKE_EX_SUPPORTED;
+#if FREERDP_VERSION_MAJOR >= 3
+	/*
+	 * Window List capability set (MS-RDPERP 2.2.1.1.2). The client adopts the
+	 * level the server announces here, and FreeRDP 3 clients reject every
+	 * window order (incl. the monitored desktop ARC_BEGAN/ARC_COMPLETED that
+	 * triggers the app launch) unless it is at least WINDOW_LEVEL_SUPPORTED.
+	 * FreeRDP 2 defaulted to these values, FreeRDP 3 does not.
+	 */
+	settings->RemoteWndSupportLevel = WINDOW_LEVEL_SUPPORTED_EX;
+	settings->RemoteAppNumIconCaches = 3;
+	settings->RemoteAppNumIconCacheEntries = 12;
+#endif
 	settings->SupportGraphicsPipeline = TRUE;
 	settings->SupportMonitorLayoutPdu = TRUE;
 	settings->RedirectClipboard = TRUE;
