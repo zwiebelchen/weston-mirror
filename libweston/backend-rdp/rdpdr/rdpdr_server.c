@@ -10,6 +10,7 @@
  *  - directory listing pattern "*" instead of "*.*"
  *  - completion ids handed out atomically (requests come from several threads)
  *  - optional padding / Information bytes accepted
+ *  - added weston_rdpdr_server_send_printer_using_xps (DR_PRN_USING_XPS)
  *  - one PDU per channel message (leftover padding was parsed as a PDU)
  *  - client capability evaluation fixed (upstream mapped capability types
  *    onto device type bits and disabled drives before seeing their cap)
@@ -3731,6 +3732,24 @@ static RdpdrServerPrivate* rdpdr_server_private_new(void)
 fail:
 	rdpdr_server_private_free(priv);
 	return NULL;
+}
+
+/* weston-mirror addition: MS-RDPEPC 2.2.2.2 Server Printer Set XPS Mode
+ * (DR_PRN_USING_XPS). Without it mstsc hands XPS data to the printer as
+ * RAW bytes, i.e. the printer prints the XML. */
+UINT weston_rdpdr_server_send_printer_using_xps(RdpdrServerContext* context, UINT32 printerId);
+UINT weston_rdpdr_server_send_printer_using_xps(RdpdrServerContext* context, UINT32 printerId)
+{
+	wStream* s = Stream_New(NULL, 12);
+
+	WINPR_ASSERT(context);
+	if (!s)
+		return CHANNEL_RC_NO_MEMORY;
+	Stream_Write_UINT16(s, RDPDR_CTYP_PRN);      /* Component (2 bytes) */
+	Stream_Write_UINT16(s, PAKID_PRN_USING_XPS); /* PacketId (2 bytes) */
+	Stream_Write_UINT32(s, printerId);          /* PrinterId (4 bytes) */
+	Stream_Write_UINT32(s, 0);                  /* Flags (4 bytes, unused) */
+	return rdpdr_seal_send_free_request(context, s);
 }
 
 RdpdrServerContext* weston_rdpdr_server_context_new(HANDLE vcm)

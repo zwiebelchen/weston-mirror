@@ -74,6 +74,7 @@
 /* patched copy of FreeRDP's rdpdr server, see rdpdr/rdpdr_server.c */
 RdpdrServerContext *weston_rdpdr_server_context_new(HANDLE vcm);
 void weston_rdpdr_server_context_free(RdpdrServerContext *context);
+UINT weston_rdpdr_server_send_printer_using_xps(RdpdrServerContext *context, UINT32 printerId);
 #include <freerdp/utils/rdpdr_utils.h>
 #include <winpr/nt.h>
 
@@ -594,6 +595,10 @@ drv_open(struct rdp_drives *d, UINT32 dev, const char *rel, UINT32 access,
 	if (rc == 0) {
 		rc = -nt_to_errno(w->io_status);
 		*file_id = w->file_id;
+		if (rc < 0 && rc != -ENOENT && rc != -EEXIST)
+			weston_log("RDP drives: open '%s' (access 0x%x, disposition %u) "
+				   "failed: NTSTATUS 0x%08x\n", rel, access, disposition,
+				   w->io_status);
 	}
 	wait_put(w);
 	return rc;
@@ -747,16 +752,25 @@ op_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
 	return 0;
 }
 
+/*
+ * Specific access rights, as Windows servers send them (see the examples
+ * in MS-RDPEPC/MS-RDPEFS). With GENERIC_READ/GENERIC_WRITE mstsc created
+ * files but refused to read or write them (EIO / EACCES); FreeRDP clients
+ * accept both forms.
+ */
+#define RDP_FILE_GENERIC_READ 0x00120089u
+#define RDP_FILE_GENERIC_WRITE 0x00120116u
+
 static UINT32
 access_from_flags(int flags)
 {
 	switch (flags & O_ACCMODE) {
 	case O_WRONLY:
-		return GENERIC_WRITE;
+		return RDP_FILE_GENERIC_WRITE;
 	case O_RDWR:
-		return GENERIC_READ | GENERIC_WRITE;
+		return RDP_FILE_GENERIC_READ | RDP_FILE_GENERIC_WRITE;
 	default:
-		return GENERIC_READ;
+		return RDP_FILE_GENERIC_READ;
 	}
 }
 
@@ -803,7 +817,7 @@ op_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 	else
 		disposition = FILE_OPEN_IF;
 
-	rc = drv_open(d, dev, rel, access_from_flags(fi->flags) | GENERIC_READ,
+	rc = drv_open(d, dev, rel, access_from_flags(fi->flags) | RDP_FILE_GENERIC_READ,
 		      disposition, &file_id);
 	if (rc < 0)
 		return rc;
@@ -836,6 +850,8 @@ op_read(const char *path, char *buf, size_t size, off_t offset,
 		rc = 0;
 	} else if (w->io_status != STATUS_SUCCESS) {
 		rc = -nt_to_errno(w->io_status);
+		weston_log("RDP drives: read %zu bytes at %lld failed: NTSTATUS 0x%08x\n",
+			   size, (long long)offset, w->io_status);
 	} else {
 		rc = (int)(w->length < size ? w->length : size);
 		memcpy(buf, w->buffer, rc);
@@ -867,6 +883,9 @@ op_write(const char *path, const char *buf, size_t size, off_t offset,
 	}
 	rc = w->io_status == STATUS_SUCCESS ? (int)w->length
 					    : -nt_to_errno(w->io_status);
+	if (rc < 0)
+		weston_log("RDP drives: write %zu bytes at %lld failed: NTSTATUS 0x%08x\n",
+			   size, (long long)offset, w->io_status);
 	wait_put(w);
 	cache_clear(d);
 	return rc;
@@ -971,7 +990,7 @@ op_truncate(const char *path, off_t size, struct fuse_file_info *fi)
 	(void)fi;
 	if (size == 0) {
 		/* the only truncation the API can express: overwrite */
-		rc = drv_open(d, dev, rel, GENERIC_WRITE, FILE_OVERWRITE, &file_id);
+		rc = drv_open(d, dev, rel, RDP_FILE_GENERIC_WRITE, FILE_OVERWRITE, &file_id);
 		if (rc == 0)
 			drv_close(d, dev, file_id);
 		cache_clear(d);
@@ -1008,6 +1027,25 @@ op_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *fi)
 	(void)path;
 	(void)uid;
 	(void)gid;
+	(void)fi;
+	return 0;
+}
+
+/* data goes to the client with every write; nothing to flush, but GIO and
+ * editors call fsync()/flush and treat ENOSYS as a failed save */
+static int
+op_flush(const char *path, struct fuse_file_info *fi)
+{
+	(void)path;
+	(void)fi;
+	return 0;
+}
+
+static int
+op_fsync(const char *path, int datasync, struct fuse_file_info *fi)
+{
+	(void)path;
+	(void)datasync;
 	(void)fi;
 	return 0;
 }
@@ -1056,6 +1094,8 @@ static const struct fuse_operations rdp_drive_ops = {
 	.chmod = op_chmod,
 	.chown = op_chown,
 	.statfs = op_statfs,
+	.flush = op_flush,
+	.fsync = op_fsync,
 };
 
 /* ------------------------------------------------------------------ */
@@ -1492,6 +1532,13 @@ on_printer_create(RdpdrServerContext *context, const RdpdrDevice *device)
 	if (slot < 0)
 		return CHANNEL_RC_OK;
 
+	if (!strcmp(print_format_for(&pr), "xps") &&
+	    (pr.flags & RDPDR_PRINTER_ANNOUNCE_FLAG_XPSFORMAT)) {
+		/* tell the client that jobs for this printer are XPS */
+		if (weston_rdpdr_server_send_printer_using_xps(d->rdpdr, pr.device_id) != CHANNEL_RC_OK)
+			weston_log("RDP printers: could not switch '%s' to XPS mode\n", pr.name);
+	}
+
 	job = xzalloc(sizeof *job);
 	job->printer = pr;
 	snprintf(job->uri, sizeof job->uri, "rdpprint:%s?device=%u",
@@ -1610,7 +1657,7 @@ spool_handle(struct rdp_drives *d, int fd)
 		return;
 	}
 
-	rc = drv_open(d, (UINT32)device, "", GENERIC_WRITE, FILE_OPEN_IF, &file_id);
+	rc = drv_open(d, (UINT32)device, "", 0x0012019f, FILE_OPEN, &file_id);
 	if (rc < 0) {
 		weston_log("RDP printers: cannot open '%s' on the client (%d)\n", name, rc);
 		spool_reply(fd, "ERR client refused the print job\n");
