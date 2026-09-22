@@ -72,7 +72,7 @@
 #define BROKER_PAM_SERVICE "weston-rail"
 #define TOKEN_LIFETIME_SEC 60
 #define AUTH_TIMEOUT_SEC 60
-#define HANDOFF_WAIT_SEC 20
+#define HANDOFF_WAIT_SEC 45
 #define TOKEN_HEX_LEN 32
 
 #ifndef WINDOW_LEVEL_SUPPORTED_EX
@@ -372,6 +372,28 @@ copy_file_for_user(const char *src, const char *dst, uid_t uid, gid_t gid)
 	return ok;
 }
 
+struct pam_open_job {
+	pam_handle_t *pamh;
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	bool done;
+	int rc;
+};
+
+static void *
+pam_open_thread(void *data)
+{
+	struct pam_open_job *job = data;
+	int rc = pam_open_session(job->pamh, PAM_SILENT);
+
+	pthread_mutex_lock(&job->lock);
+	job->rc = rc;
+	job->done = true;
+	pthread_cond_signal(&job->cond);
+	pthread_mutex_unlock(&job->lock);
+	return NULL;
+}
+
 /* runs in the session keeper process (root), never returns */
 static void
 session_keeper(const struct passwd *pw, const char *ctl)
@@ -381,22 +403,56 @@ session_keeper(const struct passwd *pw, const char *ctl)
 	pam_handle_t *pamh = NULL;
 	char rundir[64], logpath[128], certpath[128], keypath[128], lang[64];
 	char **penv = NULL;
-	bool session_open = false;
+	bool session_open = false, pam_done = false, pam_pending = false;
+	pthread_t pam_thread;
 	struct stat st;
 	pid_t pid;
 	int rc, status = 0;
 
 	setsid();
 
+	/*
+	 * pam_systemd blocks for 25 s when systemd-logind does not answer (e.g.
+	 * an LXC container without "nesting"), longer than the client waits for
+	 * its session. Open the PAM session in a thread and give it 5 s; after
+	 * that weston starts anyway (the runtime directory is created below)
+	 * and the session is closed later if it opened after all.
+	 */
 	rc = pam_start(BROKER_PAM_SERVICE, pw->pw_name, &conv, &pamh);
 	if (rc == PAM_SUCCESS) {
+		struct pam_open_job job = { .pamh = pamh };
+		struct timespec deadline;
+		pthread_t tid;
+
 		pam_set_item(pamh, PAM_TTY, "weston-rail");
 		pam_setcred(pamh, PAM_ESTABLISH_CRED);
-		if (pam_open_session(pamh, PAM_SILENT) == PAM_SUCCESS)
-			session_open = true;
-		else
-			logmsg("session for %s: no PAM session (continuing)", pw->pw_name);
-		penv = pam_getenvlist(pamh);
+		pthread_mutex_init(&job.lock, NULL);
+		pthread_cond_init(&job.cond, NULL);
+		if (pthread_create(&tid, NULL, pam_open_thread, &job) == 0) {
+			clock_gettime(CLOCK_REALTIME, &deadline);
+			deadline.tv_sec += 5;
+			pthread_mutex_lock(&job.lock);
+			while (!job.done &&
+			       pthread_cond_timedwait(&job.cond, &job.lock, &deadline) == 0)
+				;
+			pam_done = job.done;
+			pthread_mutex_unlock(&job.lock);
+			if (pam_done) {
+				pthread_join(tid, NULL);
+				session_open = job.rc == PAM_SUCCESS;
+				if (session_open)
+					penv = pam_getenvlist(pamh);
+				else
+					logmsg("session for %s: no PAM session (continuing)",
+					       pw->pw_name);
+			} else {
+				pam_thread = tid;
+				pam_pending = true;
+				logmsg("session for %s: PAM session does not answer (is "
+				       "systemd-logind running? LXC: Options -> Features -> "
+				       "nesting), starting without it", pw->pw_name);
+			}
+		}
 	}
 
 	/* pam_systemd creates the runtime directory; without logind do it */
@@ -496,6 +552,11 @@ session_keeper(const struct passwd *pw, const char *ctl)
 	}
 	unlink(certpath);
 	unlink(keypath);
+	if (pam_pending) {
+		/* the late PAM session: wait for it before closing */
+		pthread_join(pam_thread, NULL);
+		session_open = true;
+	}
 	if (pamh) {
 		if (session_open)
 			pam_close_session(pamh, PAM_SILENT);
