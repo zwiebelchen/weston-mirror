@@ -271,7 +271,7 @@ Wichtig:
   (die mobilen Apps können ein unbekanntes Zertifikat akzeptieren). Ein
   eigenes Zertifikat, z. B. Let's Encrypt, per
   `sudo systemctl edit weston-rail-feed` →
-  `Environment="FEED_ARGS=--cert=/pfad/fullchain.pem --key=/pfad/privkey.pem`."
+  `Environment="FEED_ARGS=--cert=/pfad/fullchain.pem --key=/pfad/privkey.pem"`.
 - **Hinter einem Reverse Proxy** (Caddy, nginx) mit Let's-Encrypt-Zertifikat
   spricht der Feed nur HTTP auf localhost, TLS macht der Proxy (siehe
   „Feed hinter Caddy“).
