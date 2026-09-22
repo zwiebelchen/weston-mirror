@@ -25,7 +25,7 @@ Getestet mit Windows `mstsc` gegen einen Debian-13-LXC-Container auf Proxmox.
 | Session endet nach der letzten App / Wiederverbinden | ja |
 | Ton-Ausgabe | **fehlt** (die WSLg-PulseAudio-Senke gibt es unter Debian nicht) |
 | Mikrofon (audin) | fehlt (unter FreeRDP 3 noch nicht portiert) |
-| Passwortwechsel → NT-Hash automatisch nachziehen | fehlt (siehe NLA) |
+| Passwortwechsel → NT-Hash automatisch nachziehen | ja, PAM-Modul `pam_weston_rail.so` |
 | Linux-Client `xfreerdp3` | startet, Fensterinhalt bleibt schwarz (Client-Problem) |
 | App-Liste an den Client publizieren (`rdpapplist`) | nicht verfügbar (Microsoft-eigener Kanal) |
 
@@ -156,17 +156,20 @@ sudo weston-rail-passwd -l       # eingetragene User
 sudo weston-rail-passwd -d lars  # entfernen
 ```
 
-Automatisch eintragen bei jeder Linux-Anmeldung mit Passwort (SSH, Konsole,
-Anmeldung am Broker ohne NLA) – ans Ende von `/etc/pam.d/common-auth`:
+Automatisch aktuell halten mit dem PAM-Modul `pam_weston_rail.so`: Es trägt
+den NT-Hash bei jeder Linux-Anmeldung mit Passwort ein (SSH, Konsole, `su`,
+Broker-Anmeldung ohne NLA) und zieht ihn bei jedem Passwortwechsel nach. Es
+beeinflusst das Ergebnis der Anmeldung nie. Jeweils ans **Ende** der Dateien
+anhängen:
 
-```
-auth	optional	pam_exec.so expose_authtok quiet /usr/local/sbin/weston-rail-passwd --pam-sync
+```bash
+M=/usr/local/lib/x86_64-linux-gnu/security/pam_weston_rail.so
+echo "auth	optional	$M" | sudo tee -a /etc/pam.d/common-auth
+echo "password	optional	$M" | sudo tee -a /etc/pam.d/common-password
 ```
 
-Nach einem **Passwortwechsel** stimmt der NT-Hash nicht mehr, bis sich der
-User einmal anderweitig anmeldet oder `weston-rail-passwd` erneut läuft
-(`pam_exec` reicht beim Passwortwechsel das neue Passwort nicht weiter; ein
-eigenes PAM-Modul dafür ist geplant).
+(Nicht direkt hinter die `pam_unix`-Zeile setzen: deren `success=1` würde
+sonst die falsche Zeile überspringen.)
 
 **Mit Active Directory – Kerberos (noch nicht getestet).** Server in die
 Domäne aufnehmen (z. B. `realm join`), Dienstprinzipal

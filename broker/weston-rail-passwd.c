@@ -275,7 +275,8 @@ pam_sync(void)
 
 	if (!user || !valid_username(user) || !getpwnam(user))
 		return 0;
-	if (type && strcmp(type, "auth") != 0 && strcmp(type, "password") != 0)
+	if (type && strcmp(type, "auth") != 0 && strcmp(type, "password") != 0 &&
+	    strcmp(type, "sync") != 0)
 		return 0;
 	n = fread(pw, 1, sizeof pw - 1, stdin);
 	pw[n] = '\0';

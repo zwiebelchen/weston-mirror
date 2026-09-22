@@ -28,6 +28,18 @@ executable(
 	install_dir: join_paths(dir_prefix, get_option('sbindir')),
 )
 
+shared_module(
+	'pam_weston_rail',
+	'pam_weston_rail.c',
+	name_prefix: '',
+	include_directories: common_inc,
+	c_args: [ '-DWESTON_RAIL_PASSWD="@0@"'.format(
+		join_paths(dir_prefix, get_option('sbindir'), 'weston-rail-passwd')) ],
+	dependencies: [ dep_pam_broker ],
+	install: true,
+	install_dir: join_paths(dir_lib, 'security'),
+)
+
 install_data('weston-rail.pam',
 	rename: 'weston-rail',
 	install_dir: '/etc/pam.d')
