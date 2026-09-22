@@ -326,6 +326,41 @@ sudo systemctl edit weston-rail-broker
 die ganze Zuweisung in Anführungszeichen setzen: `Environment="…"`, sonst
 ignoriert systemd alles nach dem ersten Leerzeichen.)
 
+### .rdp-Dateien signieren (optional)
+
+Ohne Signatur zeigt Windows beim Start „Unbekannter Herausgeber“ und schaltet
+Laufwerke, Zwischenablage und Drucker standardmäßig ab. Mit Signatur steht
+dort der Name aus dem Zertifikat, die Auswahl lässt sich merken, und per GPO
+kann die Warnung ganz entfallen.
+
+Signiert wird wie mit Microsofts `rdpsign.exe`, mit einem Zertifikat samt
+Schlüssel (PEM), z. B. demselben Let's-Encrypt-Zertifikat wie für den
+Broker. Ohne diese Optionen bleiben die Dateien unsigniert:
+
+```bash
+sudo systemctl edit weston-rail-feed
+#   [Service]
+#   Environment="FEED_ARGS=--http --listen=10.10.10.244 --port=8080 --sign-cert=/pfad/fullchain.pem --sign-key=/pfad/key.pem"
+sudo systemctl restart weston-rail-feed
+```
+
+Zertifikat und Schlüssel werden bei jedem Abruf neu gelesen; ein
+verlängertes Zertifikat gilt also ohne Neustart. Danach unter „RemoteApp- und
+Desktopverbindungen“ einmal „Jetzt aktualisieren“.
+
+Warnung per GPO abschalten: Computer- oder Benutzerkonfiguration →
+Administrative Vorlagen → Windows-Komponenten → Remotedesktopdienste →
+Remotedesktopverbindungs-Client → „SHA1-Fingerabdrücke von Zertifikaten
+angeben, die vertrauenswürdige RDP-Herausgeber darstellen“. Fingerabdruck:
+
+```bash
+openssl x509 -in /pfad/fullchain.pem -noout -fingerprint -sha1 | tr -d ':' 
+```
+
+Bei Let's Encrypt ändert sich der Fingerabdruck mit jeder Verlängerung (etwa
+alle 60–90 Tage); die GPO muss dann nachgezogen werden – oder man verzichtet
+darauf und lässt die Nutzer „Nicht erneut fragen“ wählen.
+
 ## Allowlist: veröffentlichte Programme
 
 Ein Client kann nur Programme starten, die in `/etc/weston-rail/apps.conf`
@@ -474,8 +509,8 @@ redirectprinters:i:1
   dabei NT-Hashes direkt aus Samba beziehen statt aus `ntlm.sam`
 - **Verwaltungs-Snap-in für ice2k** (veröffentlichte Programme, Sessions,
   Broker-Dienst) auf Basis von `weston-rail-sessions --json` und `apps.conf`
-- `.rdp`-Dateien im Feed signieren (sonst warnt Windows beim Start vor einem
-  unbekannten Herausgeber)
+- Let's-Encrypt-Zertifikat automatisch von der OPNsense in den Container
+  übertragen (ACME-Automatisierung per SFTP)
 
 ## Änderungen gegenüber microsoft/weston-mirror
 

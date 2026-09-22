@@ -48,7 +48,10 @@
 #include <unistd.h>
 
 #include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/pkcs7.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
 
 static struct {
 	int port;
@@ -57,6 +60,8 @@ static struct {
 	const char *apps_conf;
 	const char *icon_cache;
 	const char *listen_addr;	/* NULL: all addresses */
+	const char *sign_cert;		/* optional: sign the .rdp files */
+	const char *sign_key;
 	bool plain_http;		/* behind a TLS reverse proxy (Caddy, nginx) */
 	bool verbose;
 } cfg = {
@@ -697,6 +702,236 @@ serve_feed(struct conn *ssl, bool head, struct workspace *ws, const char *host)
 	free(b.data);
 }
 
+
+/* ---- signing of .rdp files (optional) ----------------------------- */
+
+/*
+ * Same format as Microsoft's rdpsign.exe (see also nfedera/rdpsign):
+ * the "secure" settings present in the file, in this fixed order, plus
+ * "signscope:s:<names>" are joined with CRLF, NUL terminated, encoded as
+ * UTF-16LE and signed as detached PKCS#7 (DER, no signed attributes).
+ * The signature line is base64 of a 12 byte header (0x00010001,
+ * 0x00000001, length) followed by the DER blob.
+ */
+static const struct {
+	const char *prefix;
+	const char *name;
+} secure_settings[] = {
+	{ "full address:s:", "Full Address" },
+	{ "alternate full address:s:", "Alternate Full Address" },
+	{ "pcb:s:", "PCB" },
+	{ "use redirection server name:i:", "Use Redirection Server Name" },
+	{ "server port:i:", "Server Port" },
+	{ "negotiate security layer:i:", "Negotiate Security Layer" },
+	{ "enablecredsspsupport:i:", "EnableCredSspSupport" },
+	{ "disableconnectionsharing:i:", "DisableConnectionSharing" },
+	{ "autoreconnection enabled:i:", "AutoReconnection Enabled" },
+	{ "gatewayhostname:s:", "GatewayHostname" },
+	{ "gatewayusagemethod:i:", "GatewayUsageMethod" },
+	{ "gatewayprofileusagemethod:i:", "GatewayProfileUsageMethod" },
+	{ "gatewaycredentialssource:i:", "GatewayCredentialsSource" },
+	{ "support url:s:", "Support URL" },
+	{ "promptcredentialonce:i:", "PromptCredentialOnce" },
+	{ "require pre-authentication:i:", "Require pre-authentication" },
+	{ "pre-authentication server address:s:", "Pre-authentication server address" },
+	{ "alternate shell:s:", "Alternate Shell" },
+	{ "shell working directory:s:", "Shell Working Directory" },
+	{ "remoteapplicationprogram:s:", "RemoteApplicationProgram" },
+	{ "remoteapplicationexpandworkingdir:s:", "RemoteApplicationExpandWorkingdir" },
+	{ "remoteapplicationmode:i:", "RemoteApplicationMode" },
+	{ "remoteapplicationguid:s:", "RemoteApplicationGuid" },
+	{ "remoteapplicationname:s:", "RemoteApplicationName" },
+	{ "remoteapplicationicon:s:", "RemoteApplicationIcon" },
+	{ "remoteapplicationfile:s:", "RemoteApplicationFile" },
+	{ "remoteapplicationfileextensions:s:", "RemoteApplicationFileExtensions" },
+	{ "remoteapplicationcmdline:s:", "RemoteApplicationCmdLine" },
+	{ "remoteapplicationexpandcmdline:s:", "RemoteApplicationExpandCmdLine" },
+	{ "prompt for credentials:i:", "Prompt For Credentials" },
+	{ "authentication level:i:", "Authentication Level" },
+	{ "audiomode:i:", "AudioMode" },
+	{ "redirectdrives:i:", "RedirectDrives" },
+	{ "redirectprinters:i:", "RedirectPrinters" },
+	{ "redirectcomports:i:", "RedirectCOMPorts" },
+	{ "redirectsmartcards:i:", "RedirectSmartCards" },
+	{ "redirectposdevices:i:", "RedirectPOSDevices" },
+	{ "redirectclipboard:i:", "RedirectClipboard" },
+	{ "devicestoredirect:s:", "DevicesToRedirect" },
+	{ "drivestoredirect:s:", "DrivesToRedirect" },
+	{ "loadbalanceinfo:s:", "LoadBalanceInfo" },
+	{ "redirectdirectx:i:", "RedirectDirectX" },
+	{ "rdgiskdcproxy:i:", "RDGIsKDCProxy" },
+	{ "kdcproxyname:s:", "KDCProxyName" },
+	{ "eventloguploadaddress:s:", "EventLogUploadAddress" },
+};
+
+/* UTF-8 -> UTF-16LE (with surrogate pairs); returns bytes written */
+static size_t
+utf8_to_utf16le(const char *in, size_t in_len, unsigned char *out)
+{
+	const unsigned char *p = (const unsigned char *)in, *end = p + in_len;
+	size_t o = 0;
+
+	while (p < end) {
+		unsigned cp;
+
+		if (*p < 0x80) {
+			cp = *p++;
+		} else if ((*p & 0xe0) == 0xc0 && p + 1 < end) {
+			cp = (p[0] & 0x1fu) << 6 | (p[1] & 0x3fu);
+			p += 2;
+		} else if ((*p & 0xf0) == 0xe0 && p + 2 < end) {
+			cp = (p[0] & 0x0fu) << 12 | (p[1] & 0x3fu) << 6 | (p[2] & 0x3fu);
+			p += 3;
+		} else if ((*p & 0xf8) == 0xf0 && p + 3 < end) {
+			cp = (p[0] & 0x07u) << 18 | (p[1] & 0x3fu) << 12 |
+			     (p[2] & 0x3fu) << 6 | (p[3] & 0x3fu);
+			p += 4;
+		} else {
+			cp = 0xfffd;
+			p++;
+		}
+		if (cp >= 0x10000) {
+			unsigned v = cp - 0x10000, hi = 0xd800 | (v >> 10), lo = 0xdc00 | (v & 0x3ff);
+
+			out[o++] = hi & 0xff;
+			out[o++] = hi >> 8;
+			out[o++] = lo & 0xff;
+			out[o++] = lo >> 8;
+		} else {
+			out[o++] = cp & 0xff;
+			out[o++] = (cp >> 8) & 0xff;
+		}
+	}
+	return o;
+}
+
+static const char b64chars[] =
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static void
+base64_append(struct buf *b, const unsigned char *d, size_t len)
+{
+	for (size_t i = 0; i < len; i += 3) {
+		unsigned v = (unsigned)d[i] << 16 | (i + 1 < len ? (unsigned)d[i + 1] << 8 : 0) |
+			     (i + 2 < len ? d[i + 2] : 0);
+
+		buf_add(b, "%c%c%c%c", b64chars[v >> 18 & 63], b64chars[v >> 12 & 63],
+			i + 1 < len ? b64chars[v >> 6 & 63] : '=',
+			i + 2 < len ? b64chars[v & 63] : '=');
+	}
+}
+
+/*
+ * Append "signscope" and "signature" to the CRLF separated settings in
+ * RDP. Certificate and key are read on every call, so a renewed
+ * certificate is used without restart. Returns false on any error (the
+ * caller then serves the file unsigned and logs it).
+ */
+static bool
+sign_rdp(struct buf *rdp)
+{
+	struct buf msg = { 0 }, names = { 0 };
+	unsigned char *utf16 = NULL, *der = NULL, *blob = NULL;
+	STACK_OF(X509) *chain = NULL;
+	X509 *cert = NULL, *extra;
+	EVP_PKEY *key = NULL;
+	PKCS7 *p7 = NULL;
+	BIO *data = NULL;
+	FILE *f;
+	int der_len;
+	size_t utf16_len;
+	bool ok = false;
+
+	/* signed lines in the fixed order of the secure settings */
+	for (size_t i = 0; i < sizeof secure_settings / sizeof secure_settings[0]; i++) {
+		size_t plen = strlen(secure_settings[i].prefix);
+		const char *p = rdp->data;
+
+		while (p && *p) {
+			const char *eol = strstr(p, "\r\n");
+			size_t llen = eol ? (size_t)(eol - p) : strlen(p);
+
+			if (llen >= plen && !strncmp(p, secure_settings[i].prefix, plen)) {
+				buf_add(&msg, "%.*s\r\n", (int)llen, p);
+				buf_add(&names, "%s%s", names.len ? "," : "", secure_settings[i].name);
+				break;
+			}
+			p = eol ? eol + 2 : NULL;
+		}
+	}
+	if (!names.len)
+		goto out;
+	buf_add(&msg, "signscope:s:%s\r\n", names.data);
+
+	/* UTF-16LE including the terminating NUL character */
+	utf16 = malloc((msg.len + 1) * 4);
+	if (!utf16)
+		goto out;
+	utf16_len = utf8_to_utf16le(msg.data, msg.len, utf16);
+	utf16[utf16_len++] = 0;
+	utf16[utf16_len++] = 0;
+
+	f = fopen(cfg.sign_cert, "re");
+	if (!f)
+		goto out;
+	cert = PEM_read_X509(f, NULL, NULL, NULL);
+	chain = sk_X509_new_null();
+	/* the rest of a fullchain file: intermediates, sent along */
+	while (chain && (extra = PEM_read_X509(f, NULL, NULL, NULL)))
+		sk_X509_push(chain, extra);
+	fclose(f);
+	ERR_clear_error();	/* end of file after the last certificate */
+	f = fopen(cfg.sign_key, "re");
+	if (!f)
+		goto out;
+	key = PEM_read_PrivateKey(f, NULL, NULL, NULL);
+	fclose(f);
+	if (!cert || !key || !X509_check_private_key(cert, key))
+		goto out;
+
+	data = BIO_new_mem_buf(utf16, (int)utf16_len);
+	p7 = PKCS7_sign(cert, key, chain, data,
+			PKCS7_BINARY | PKCS7_DETACHED | PKCS7_NOATTR | PKCS7_NOSMIMECAP);
+	if (!p7)
+		goto out;
+	der_len = i2d_PKCS7(p7, &der);
+	if (der_len <= 0)
+		goto out;
+
+	blob = malloc((size_t)der_len + 12);
+	if (!blob)
+		goto out;
+	blob[0] = 0x01; blob[1] = 0x00; blob[2] = 0x01; blob[3] = 0x00;
+	blob[4] = 0x01; blob[5] = 0x00; blob[6] = 0x00; blob[7] = 0x00;
+	blob[8] = der_len & 0xff;
+	blob[9] = (der_len >> 8) & 0xff;
+	blob[10] = (der_len >> 16) & 0xff;
+	blob[11] = (der_len >> 24) & 0xff;
+	memcpy(blob + 12, der, (size_t)der_len);
+
+	buf_add(rdp, "signscope:s:%s\r\nsignature:s:", names.data);
+	base64_append(rdp, blob, (size_t)der_len + 12);
+	buf_add(rdp, "\r\n");
+	ok = true;
+out:
+	if (!ok)
+		logmsg("cannot sign .rdp files with %s / %s (serving them unsigned): %s",
+		       cfg.sign_cert, cfg.sign_key,
+		       ERR_peek_last_error() ? ERR_error_string(ERR_get_error(), NULL)
+					     : "certificate, key or signscope missing");
+	free(msg.data);
+	free(names.data);
+	free(utf16);
+	free(blob);
+	OPENSSL_free(der);
+	PKCS7_free(p7);
+	BIO_free(data);
+	X509_free(cert);
+	sk_X509_pop_free(chain, X509_free);
+	EVP_PKEY_free(key);
+	return ok;
+}
+
 static void
 serve_rdp(struct conn *ssl, bool head, struct workspace *ws, const char *host, struct app *a)
 {
@@ -726,6 +961,9 @@ serve_rdp(struct conn *ssl, bool head, struct workspace *ws, const char *host, s
 		for (line = strtok_r(extra, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
 			buf_add(&b, "%s\r\n", line);
 	}
+	/* optional: only with --sign-cert/--sign-key */
+	if (cfg.sign_cert && cfg.sign_key)
+		sign_rdp(&b);
 	snprintf(disp, sizeof disp, "Content-Disposition: attachment; filename=\"%s.rdp\"\r\n",
 		 a->name);
 	respond(ssl, head, 200, "application/x-rdp", b.data, b.len, disp);
@@ -910,6 +1148,8 @@ main(int argc, char *argv[])
 		{ "key", required_argument, NULL, 'k' },
 		{ "apps", required_argument, NULL, 'a' },
 		{ "http", no_argument, NULL, 'H' },
+		{ "sign-cert", required_argument, NULL, 'S' },
+		{ "sign-key", required_argument, NULL, 'K' },
 		{ "listen", required_argument, NULL, 'l' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
@@ -927,6 +1167,8 @@ main(int argc, char *argv[])
 		case 'k': cfg.key = optarg; break;
 		case 'a': cfg.apps_conf = optarg; break;
 		case 'H': cfg.plain_http = true; break;
+		case 'S': cfg.sign_cert = optarg; break;
+		case 'K': cfg.sign_key = optarg; break;
 		case 'l': cfg.listen_addr = optarg; break;
 		case 'v': cfg.verbose = true; break;
 		default:
@@ -934,12 +1176,21 @@ main(int argc, char *argv[])
 				"usage: weston-rail-feed [--port=443] [--cert=FILE] [--key=FILE]\n"
 				"                        [--apps=/etc/weston-rail/apps.conf] [-v]\n"
 				"       behind a TLS reverse proxy (Caddy, nginx):\n"
-				"       weston-rail-feed --http --listen=127.0.0.1 --port=8080\n");
+				"       weston-rail-feed --http --listen=127.0.0.1 --port=8080\n"
+				"       optional signing of the .rdp files (like rdpsign.exe):\n"
+				"       --sign-cert=fullchain.pem --sign-key=key.pem\n");
 			return opt == 'h' ? 0 : 2;
 		}
 	}
 	signal(SIGPIPE, SIG_IGN);
 	setvbuf(stderr, NULL, _IOLBF, 0);
+
+	if ((cfg.sign_cert != NULL) != (cfg.sign_key != NULL)) {
+		logmsg("--sign-cert and --sign-key belong together");
+		return 1;
+	}
+	if (cfg.sign_cert)
+		logmsg(".rdp files are signed with %s", cfg.sign_cert);
 
 	if (!cfg.plain_http && (!(ssl_ctx = SSL_CTX_new(TLS_server_method())) ||
 	    SSL_CTX_use_certificate_chain_file(ssl_ctx, cfg.cert) != 1 ||
