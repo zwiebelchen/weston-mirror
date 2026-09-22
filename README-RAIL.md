@@ -357,9 +357,19 @@ angeben, die vertrauenswürdige RDP-Herausgeber darstellen“. Fingerabdruck:
 openssl x509 -in /pfad/fullchain.pem -noout -fingerprint -sha1 | tr -d ':' 
 ```
 
+Ohne diesen Eintrag fragt Windows bei jedem Start nach, auch wenn
+„Meine Auswahl … merken“ angehakt ist (getestet mit Windows 11). Zum Testen
+auf einem einzelnen Rechner genügt der Registry-Wert, den die GPO setzt:
+
+```
+reg add "HKCU\Software\Policies\Microsoft\Windows NT\Terminal Services" /v TrustedCertThumbprints /t REG_SZ /d FINGERABDRUCK /f
+```
+
 Bei Let's Encrypt ändert sich der Fingerabdruck mit jeder Verlängerung (etwa
-alle 60–90 Tage); die GPO muss dann nachgezogen werden – oder man verzichtet
-darauf und lässt die Nutzer „Nicht erneut fragen“ wählen.
+alle 60–90 Tage) und müsste jedes Mal nachgezogen werden. Für den Betrieb
+daher besser ein eigenes, lange gültiges Zertifikat nur zum Signieren
+verwenden (`--sign-cert`/`--sign-key` sind unabhängig vom TLS-Zertifikat)
+und dessen Fingerabdruck einmal per GPO verteilen.
 
 ## Allowlist: veröffentlichte Programme
 
