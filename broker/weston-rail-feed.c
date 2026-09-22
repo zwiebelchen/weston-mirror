@@ -56,6 +56,8 @@ static struct {
 	const char *key;
 	const char *apps_conf;
 	const char *icon_cache;
+	const char *listen_addr;	/* NULL: all addresses */
+	bool plain_http;		/* behind a TLS reverse proxy (Caddy, nginx) */
 	bool verbose;
 } cfg = {
 	.port = 443,
@@ -66,6 +68,38 @@ static struct {
 };
 
 static SSL_CTX *ssl_ctx;
+
+/* one client connection: TLS, or plain HTTP behind a reverse proxy */
+struct conn {
+	SSL *ssl;
+	int fd;
+};
+
+static int
+conn_read(struct conn *c, void *buf, int len)
+{
+	ssize_t n;
+
+	if (c->ssl)
+		return SSL_read(c->ssl, buf, len);
+	do {
+		n = read(c->fd, buf, (size_t)len);
+	} while (n < 0 && errno == EINTR);
+	return (int)n;
+}
+
+static int
+conn_write(struct conn *c, const void *buf, int len)
+{
+	ssize_t n;
+
+	if (c->ssl)
+		return SSL_write(c->ssl, buf, len);
+	do {
+		n = write(c->fd, buf, (size_t)len);
+	} while (n < 0 && errno == EINTR);
+	return (int)n;
+}
 
 /* ------------------------------------------------------------------ */
 
@@ -510,12 +544,12 @@ xml_escape(struct buf *b, const char *s)
 }
 
 static void
-send_all(SSL *ssl, const void *data, size_t len)
+send_all(struct conn *ssl, const void *data, size_t len)
 {
 	const char *p = data;
 
 	while (len > 0) {
-		int n = SSL_write(ssl, p, len > INT_MAX ? INT_MAX : (int)len);
+		int n = conn_write(ssl, p, len > INT_MAX ? INT_MAX : (int)len);
 
 		if (n <= 0)
 			return;
@@ -525,7 +559,7 @@ send_all(SSL *ssl, const void *data, size_t len)
 }
 
 static void
-respond(SSL *ssl, bool head, int code, const char *type, const void *body, size_t len,
+respond(struct conn *ssl, bool head, int code, const char *type, const void *body, size_t len,
 	const char *extra_headers)
 {
 	char hdr[1024];
@@ -570,7 +604,7 @@ connect_address(const struct workspace *ws, const char *host, char *out, size_t 
 }
 
 static void
-serve_feed(SSL *ssl, bool head, struct workspace *ws, const char *host)
+serve_feed(struct conn *ssl, bool head, struct workspace *ws, const char *host)
 {
 	struct buf b = { 0 };
 	char now[40], updated[40], server[256];
@@ -633,7 +667,7 @@ serve_feed(SSL *ssl, bool head, struct workspace *ws, const char *host)
 }
 
 static void
-serve_rdp(SSL *ssl, bool head, struct workspace *ws, const char *host, struct app *a)
+serve_rdp(struct conn *ssl, bool head, struct workspace *ws, const char *host, struct app *a)
 {
 	struct buf b = { 0 };
 	char server[256], disp[512];
@@ -668,7 +702,7 @@ serve_rdp(SSL *ssl, bool head, struct workspace *ws, const char *host, struct ap
 }
 
 static void
-serve_icon(SSL *ssl, bool head, struct app *a, bool ico)
+serve_icon(struct conn *ssl, bool head, struct app *a, bool ico)
 {
 	char png[PATH_MAX];
 	unsigned char *data = NULL, *out;
@@ -704,7 +738,7 @@ ends_with_ci(const char *s, const char *suffix)
 }
 
 static void
-handle(SSL *ssl, const char *rhost)
+handle(struct conn *ssl, const char *rhost)
 {
 	char req[8192], method[16], path[2048], host[256] = "";
 	int n, total = 0;
@@ -714,7 +748,7 @@ handle(SSL *ssl, const char *rhost)
 
 	/* read the request header */
 	while (total < (int)sizeof req - 1) {
-		n = SSL_read(ssl, req + total, (int)sizeof req - 1 - total);
+		n = conn_read(ssl, req + total, (int)sizeof req - 1 - total);
 		if (n <= 0)
 			return;
 		total += n;
@@ -726,9 +760,22 @@ handle(SSL *ssl, const char *rhost)
 		respond(ssl, false, 400, "text/plain", "bad request\n", 12, NULL);
 		return;
 	}
-	for (line = strtok_r(req, "\r\n", &save); line; line = strtok_r(NULL, "\r\n", &save))
-		if (!strncasecmp(line, "Host:", 5))
-			snprintf(host, sizeof host, "%s", trim(line + 5));
+	{
+		char fwd_host[256] = "";
+
+		for (line = strtok_r(req, "\r\n", &save); line;
+		     line = strtok_r(NULL, "\r\n", &save)) {
+			if (!strncasecmp(line, "Host:", 5))
+				snprintf(host, sizeof host, "%s", trim(line + 5));
+			else if (!strncasecmp(line, "X-Forwarded-Host:", 17))
+				snprintf(fwd_host, sizeof fwd_host, "%s", trim(line + 17));
+		}
+		/* behind a reverse proxy the public name is what the links need */
+		if (cfg.plain_http && fwd_host[0]) {
+			fwd_host[strcspn(fwd_host, ",")] = '\0';
+			snprintf(host, sizeof host, "%s", trim(fwd_host));
+		}
+	}
 	if (!host[0] || strpbrk(host, "\"<>/ ")) {
 		respond(ssl, false, 400, "text/plain", "bad host\n", 9, NULL);
 		return;
@@ -798,13 +845,21 @@ connection_thread(void *data)
 	}
 	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-	ssl = SSL_new(ssl_ctx);
-	if (ssl) {
-		SSL_set_fd(ssl, fd);
-		if (SSL_accept(ssl) == 1)
-			handle(ssl, rhost);
-		SSL_shutdown(ssl);
-		SSL_free(ssl);
+	if (cfg.plain_http) {
+		struct conn c = { .ssl = NULL, .fd = fd };
+
+		handle(&c, rhost);
+	} else {
+		ssl = SSL_new(ssl_ctx);
+		if (ssl) {
+			struct conn c = { .ssl = ssl, .fd = fd };
+
+			SSL_set_fd(ssl, fd);
+			if (SSL_accept(ssl) == 1)
+				handle(&c, rhost);
+			SSL_shutdown(ssl);
+			SSL_free(ssl);
+		}
 	}
 	close(fd);
 	return NULL;
@@ -818,6 +873,8 @@ main(int argc, char *argv[])
 		{ "cert", required_argument, NULL, 'c' },
 		{ "key", required_argument, NULL, 'k' },
 		{ "apps", required_argument, NULL, 'a' },
+		{ "http", no_argument, NULL, 'H' },
+		{ "listen", required_argument, NULL, 'l' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
@@ -833,32 +890,44 @@ main(int argc, char *argv[])
 		case 'c': cfg.cert = optarg; break;
 		case 'k': cfg.key = optarg; break;
 		case 'a': cfg.apps_conf = optarg; break;
+		case 'H': cfg.plain_http = true; break;
+		case 'l': cfg.listen_addr = optarg; break;
 		case 'v': cfg.verbose = true; break;
 		default:
 			fprintf(stderr,
 				"usage: weston-rail-feed [--port=443] [--cert=FILE] [--key=FILE]\n"
-				"                        [--apps=/etc/weston-rail/apps.conf] [-v]\n");
+				"                        [--apps=/etc/weston-rail/apps.conf] [-v]\n"
+				"       behind a TLS reverse proxy (Caddy, nginx):\n"
+				"       weston-rail-feed --http --listen=127.0.0.1 --port=8080\n");
 			return opt == 'h' ? 0 : 2;
 		}
 	}
 	signal(SIGPIPE, SIG_IGN);
 	setvbuf(stderr, NULL, _IOLBF, 0);
 
-	ssl_ctx = SSL_CTX_new(TLS_server_method());
-	if (!ssl_ctx ||
+	if (!cfg.plain_http && (!(ssl_ctx = SSL_CTX_new(TLS_server_method())) ||
 	    SSL_CTX_use_certificate_chain_file(ssl_ctx, cfg.cert) != 1 ||
-	    SSL_CTX_use_PrivateKey_file(ssl_ctx, cfg.key, SSL_FILETYPE_PEM) != 1) {
+	    SSL_CTX_use_PrivateKey_file(ssl_ctx, cfg.key, SSL_FILETYPE_PEM) != 1)) {
 		logmsg("cannot load %s / %s (weston-rail-broker creates them on its first "
 		       "start)", cfg.cert, cfg.key);
 		return 1;
 	}
-	SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
+	if (ssl_ctx)
+		SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
 
-	lfd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (cfg.listen_addr && inet_pton(AF_INET, cfg.listen_addr, &a4.sin_addr) == 1) {
+		lfd = -1;	/* IPv4 address given: straight to the IPv4 socket */
+	} else if (cfg.listen_addr && inet_pton(AF_INET6, cfg.listen_addr, &a6.sin6_addr) != 1) {
+		logmsg("invalid --listen address %s", cfg.listen_addr);
+		return 1;
+	} else {
+		lfd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	}
 	if (lfd >= 0) {
 		setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
 		setsockopt(lfd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof off);
-		a6.sin6_addr = in6addr_any;
+		if (!cfg.listen_addr)
+			a6.sin6_addr = in6addr_any;
 		a6.sin6_port = htons(cfg.port);
 		bound = bind(lfd, (struct sockaddr *)&a6, sizeof a6) == 0;
 		if (!bound) {
@@ -871,7 +940,8 @@ main(int argc, char *argv[])
 		if (lfd < 0)
 			return 1;
 		setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
-		a4.sin_addr.s_addr = htonl(INADDR_ANY);
+		if (!cfg.listen_addr)
+			a4.sin_addr.s_addr = htonl(INADDR_ANY);
 		a4.sin_port = htons(cfg.port);
 		bound = bind(lfd, (struct sockaddr *)&a4, sizeof a4) == 0;
 	}
@@ -879,8 +949,13 @@ main(int argc, char *argv[])
 		logmsg("cannot listen on port %d: %s", cfg.port, strerror(errno));
 		return 1;
 	}
-	logmsg("weston-rail-feed listening on port %d, feed: https://<server>%s/RDWeb/Feed/webfeed.aspx",
-	       cfg.port, cfg.port == 443 ? "" : ":<port>");
+	if (cfg.plain_http)
+		logmsg("weston-rail-feed listening on %s:%d (plain HTTP for a TLS reverse proxy), "
+		       "feed path /RDWeb/Feed/webfeed.aspx",
+		       cfg.listen_addr ? cfg.listen_addr : "*", cfg.port);
+	else
+		logmsg("weston-rail-feed listening on port %d, feed: https://<server>%s/RDWeb/Feed/webfeed.aspx",
+		       cfg.port, cfg.port == 443 ? "" : ":<port>");
 
 	for (;;) {
 		pthread_t tid;

@@ -272,6 +272,9 @@ Wichtig:
   eigenes Zertifikat, z. B. Let's Encrypt, per
   `sudo systemctl edit weston-rail-feed` →
   `Environment=FEED_ARGS=--cert=/pfad/fullchain.pem --key=/pfad/privkey.pem`.
+- **Hinter einem Reverse Proxy** (Caddy, nginx) mit Let's-Encrypt-Zertifikat
+  spricht der Feed nur HTTP auf localhost, TLS macht der Proxy (siehe
+  „Feed hinter Caddy“).
 - Der Feed braucht keine Anmeldung, er listet nur die veröffentlichten
   Programme. Angemeldet wird beim Start eines Programms (NLA am Broker).
 - Einstellungen im Abschnitt `[workspace]` der `apps.conf`: `name`
@@ -281,6 +284,45 @@ Wichtig:
   Icon-Theme oder Pfad; ohne Angabe aus der `.desktop`-Datei des Programms).
 - Anmeldung per E-Mail-Adresse in der Windows App: DNS-TXT-Eintrag
   `_msradc.example.org` mit dem Wert `https://SERVER/RDWeb/Feed`.
+
+### Feed hinter Caddy (Let's Encrypt)
+
+Der Feed lauscht dann nur auf localhost und ohne eigenes TLS; Caddy belegt
+Port 443 und holt das Zertifikat:
+
+```bash
+sudo systemctl edit weston-rail-feed
+#   [Service]
+#   Environment=FEED_ARGS=--http --listen=127.0.0.1 --port=8080
+sudo systemctl restart weston-rail-feed
+```
+
+`/etc/caddy/Caddyfile`:
+
+```
+desktop.example.org {
+	reverse_proxy /RDWeb/* 127.0.0.1:8080
+}
+```
+
+Caddy reicht den Hostnamen durch, die Links im Feed zeigen damit auf
+`https://desktop.example.org/…`. Hinter anderen Proxys wird auch
+`X-Forwarded-Host` ausgewertet. Die RDP-Verbindung selbst geht weiterhin
+direkt an Port 3389 des Brokers, nicht über Caddy.
+
+Das Let's-Encrypt-Zertifikat kann auch der Broker verwenden; dann vertraut
+mstsc auch der RDP-Verbindung (`authentication-level=2` möglich). Der Broker
+liest das Zertifikat bei jeder Anmeldung neu, Verlängerungen durch Caddy
+greifen also von selbst:
+
+```bash
+D=/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/desktop.example.org
+sudo systemctl edit weston-rail-broker
+#   [Service]
+#   Environment=BROKER_ARGS=--cert=$D/desktop.example.org.crt --key=$D/desktop.example.org.key
+```
+
+(`$D` in der Unit ausgeschrieben eintragen.)
 
 ## Allowlist: veröffentlichte Programme
 
