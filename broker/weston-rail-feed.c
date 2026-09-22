@@ -1,0 +1,897 @@
+/*
+ * weston-rail-feed: workspace feed for weston-mirror RAIL RemoteApps
+ *
+ * Copyright © 2026 weston-mirror RAIL contributors
+ * MIT licensed like the rest of weston (see COPYING).
+ *
+ * Serves the published programs of /etc/weston-rail/apps.conf in the
+ * format of RD Web Access (RemoteApp and Desktop Connection feed,
+ * http://schemas.microsoft.com/ts/2007/05/tswf), so that clients can
+ * subscribe to them as a workspace:
+ *
+ *   - Windows: Control Panel -> RemoteApp and Desktop Connections
+ *     (programs appear in the start menu; needs a trusted certificate)
+ *   - Windows App on macOS, iOS/iPadOS, Android/ChromeOS: "Add workspace"
+ *
+ *   https://SERVER/RDWeb/Feed/webfeed.aspx      the feed
+ *   https://SERVER/RDWeb/Feed/rdp/<name>.rdp    connection file per program
+ *   https://SERVER/RDWeb/Feed/icon/<name>.png   icon (PNG)
+ *   https://SERVER/RDWeb/Feed/icon/<name>.ico   icon (ICO)
+ *
+ * The feed itself needs no login: it only lists what is published. Users
+ * authenticate when connecting (NLA at weston-rail-broker).
+ */
+
+#include "config.h"
+
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <limits.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+
+static struct {
+	int port;
+	const char *cert;
+	const char *key;
+	const char *apps_conf;
+	const char *icon_cache;
+	bool verbose;
+} cfg = {
+	.port = 443,
+	.cert = "/etc/weston-rail/tls.crt",
+	.key = "/etc/weston-rail/tls.key",
+	.apps_conf = "/etc/weston-rail/apps.conf",
+	.icon_cache = "/var/cache/weston-rail/icons",
+};
+
+static SSL_CTX *ssl_ctx;
+
+/* ------------------------------------------------------------------ */
+
+static void
+logmsg(const char *fmt, ...)
+{
+	va_list ap;
+	char ts[32];
+	time_t now = time(NULL);
+
+	strftime(ts, sizeof ts, "%H:%M:%S", localtime(&now));
+	fprintf(stderr, "[%s] ", ts);
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fputc('\n', stderr);
+}
+
+/* ---- configuration (apps.conf) ------------------------------------ */
+
+struct app {
+	char name[128];
+	char title[256];
+	char command[2048];
+	char icon[PATH_MAX];
+};
+
+struct workspace {
+	char name[256];
+	char address[256];	/* host[:port] the clients connect to */
+	int auth_level;
+	char rdp_extra[2048];	/* additional .rdp lines, "\n" separated */
+	struct app *apps;
+	int n_apps;
+	time_t mtime;
+};
+
+static char *
+trim(char *s)
+{
+	char *e;
+
+	while (*s == ' ' || *s == '\t')
+		s++;
+	e = s + strlen(s);
+	while (e > s && strchr(" \t\r\n", e[-1]))
+		*--e = '\0';
+	return s;
+}
+
+static bool
+load_workspace(struct workspace *ws)
+{
+	FILE *f = fopen(cfg.apps_conf, "re");
+	char line[4096], section[32] = "";
+	struct stat st;
+	struct app *cur = NULL;
+
+	memset(ws, 0, sizeof *ws);
+	gethostname(ws->name, sizeof ws->name - 1);
+	ws->auth_level = 0;
+	if (!f)
+		return false;
+	if (fstat(fileno(f), &st) == 0)
+		ws->mtime = st.st_mtime;
+	while (fgets(line, sizeof line, f)) {
+		char *l = trim(line), *eq, *k, *v;
+
+		if (!*l || *l == '#' || *l == ';')
+			continue;
+		if (*l == '[') {
+			snprintf(section, sizeof section, "%s", l);
+			cur = NULL;
+			if (!strcmp(section, "[app]")) {
+				ws->apps = realloc(ws->apps, (ws->n_apps + 1) * sizeof *ws->apps);
+				if (!ws->apps) {
+					fclose(f);
+					return false;
+				}
+				cur = &ws->apps[ws->n_apps++];
+				memset(cur, 0, sizeof *cur);
+			}
+			continue;
+		}
+		eq = strchr(l, '=');
+		if (!eq)
+			continue;
+		*eq = '\0';
+		k = trim(l);
+		v = trim(eq + 1);
+		if (!strcmp(section, "[workspace]")) {
+			if (!strcmp(k, "name"))
+				snprintf(ws->name, sizeof ws->name, "%s", v);
+			else if (!strcmp(k, "address"))
+				snprintf(ws->address, sizeof ws->address, "%s", v);
+			else if (!strcmp(k, "authentication-level"))
+				ws->auth_level = atoi(v);
+			else if (!strcmp(k, "rdp")) {
+				size_t len = strlen(ws->rdp_extra);
+
+				snprintf(ws->rdp_extra + len, sizeof ws->rdp_extra - len, "%s\n", v);
+			}
+		} else if (cur) {
+			if (!strcmp(k, "name"))
+				snprintf(cur->name, sizeof cur->name, "%s", v);
+			else if (!strcmp(k, "title"))
+				snprintf(cur->title, sizeof cur->title, "%s", v);
+			else if (!strcmp(k, "command"))
+				snprintf(cur->command, sizeof cur->command, "%s", v);
+			else if (!strcmp(k, "icon"))
+				snprintf(cur->icon, sizeof cur->icon, "%s", v);
+		}
+	}
+	fclose(f);
+	/* drop incomplete entries, default titles */
+	for (int i = 0; i < ws->n_apps; i++) {
+		struct app *a = &ws->apps[i];
+
+		if (!a->name[0] || !a->command[0]) {
+			memmove(a, a + 1, (ws->n_apps - i - 1) * sizeof *a);
+			ws->n_apps--;
+			i--;
+			continue;
+		}
+		if (!a->title[0]) {
+			snprintf(a->title, sizeof a->title, "%s", a->name);
+			a->title[0] = (char)toupper((unsigned char)a->title[0]);
+		}
+	}
+	return true;
+}
+
+static struct app *
+find_app(struct workspace *ws, const char *name)
+{
+	for (int i = 0; i < ws->n_apps; i++)
+		if (!strcasecmp(ws->apps[i].name, name))
+			return &ws->apps[i];
+	return NULL;
+}
+
+/* ---- icons ---------------------------------------------------------- */
+
+static void
+command_basename(const char *command, char *out, size_t size)
+{
+	char exe[PATH_MAX];
+	const char *slash;
+	size_t i = 0;
+
+	while (*command == ' ' || *command == '"' || *command == '\'')
+		command++;
+	while (*command && !strchr(" \t\"'", *command) && i + 1 < sizeof exe)
+		exe[i++] = *command++;
+	exe[i] = '\0';
+	slash = strrchr(exe, '/');
+	snprintf(out, size, "%s", slash ? slash + 1 : exe);
+}
+
+/* Icon= of the .desktop file whose Exec starts the same program */
+static bool
+desktop_icon_name(const char *command, char *out, size_t size)
+{
+	static const char *dirs[] = { "/usr/share/applications",
+				      "/usr/local/share/applications" };
+	char base[256];
+	bool found = false;
+
+	command_basename(command, base, sizeof base);
+	for (size_t d = 0; d < sizeof dirs / sizeof dirs[0] && !found; d++) {
+		DIR *dir = opendir(dirs[d]);
+		struct dirent *de;
+
+		if (!dir)
+			continue;
+		while (!found && (de = readdir(dir))) {
+			char path[PATH_MAX], line[1024], icon[256] = "", execb[256] = "";
+			FILE *f;
+			size_t len = strlen(de->d_name);
+
+			if (len < 9 || strcmp(de->d_name + len - 8, ".desktop"))
+				continue;
+			snprintf(path, sizeof path, "%s/%s", dirs[d], de->d_name);
+			f = fopen(path, "re");
+			if (!f)
+				continue;
+			while (fgets(line, sizeof line, f)) {
+				if (line[0] == '[' && strncmp(line, "[Desktop Entry]", 15))
+					break;	/* only the main section */
+				if (!strncmp(line, "Icon=", 5))
+					snprintf(icon, sizeof icon, "%s", trim(line + 5));
+				else if (!strncmp(line, "Exec=", 5))
+					command_basename(trim(line + 5), execb, sizeof execb);
+			}
+			fclose(f);
+			if (icon[0] && execb[0] && !strcmp(execb, base)) {
+				snprintf(out, size, "%s", icon);
+				found = true;
+			}
+		}
+		closedir(dir);
+	}
+	return found;
+}
+
+static bool
+file_exists(const char *p)
+{
+	return access(p, R_OK) == 0;
+}
+
+/* find NAME.png or NAME.svg in one icon theme directory */
+static bool
+theme_lookup(const char *theme_dir, const char *name, char *out, size_t size)
+{
+	static const char *sizes[] = { "64", "48", "128", "96", "256", "72", "32", "24" };
+	static const char *exts[] = { "png", "svg" };
+	char path[PATH_MAX];
+
+	for (size_t e = 0; e < 2; e++) {
+		for (size_t s = 0; s < sizeof sizes / sizeof sizes[0]; s++) {
+			/* freedesktop layout: 64x64/apps, and Ubuntu style: apps/64 */
+			snprintf(path, sizeof path, "%s/%sx%s/apps/%s.%s", theme_dir, sizes[s],
+				 sizes[s], name, exts[e]);
+			if (file_exists(path))
+				goto found;
+			snprintf(path, sizeof path, "%s/apps/%s/%s.%s", theme_dir, sizes[s], name,
+				 exts[e]);
+			if (file_exists(path))
+				goto found;
+		}
+		snprintf(path, sizeof path, "%s/scalable/apps/%s.%s", theme_dir, name, exts[e]);
+		if (file_exists(path))
+			goto found;
+	}
+	return false;
+found:
+	snprintf(out, size, "%s", path);
+	return true;
+}
+
+/* NAME from the themes: hicolor first (where applications install their
+ * icons), then every other theme, then /usr/share/pixmaps */
+static bool
+find_icon_file(const char *name, char *out, size_t size)
+{
+	DIR *dir;
+	struct dirent *de;
+	char path[PATH_MAX];
+	bool found = false;
+
+	if (theme_lookup("/usr/share/icons/hicolor", name, out, size) ||
+	    theme_lookup("/usr/local/share/icons/hicolor", name, out, size))
+		return true;
+	dir = opendir("/usr/share/icons");
+	if (dir) {
+		while (!found && (de = readdir(dir))) {
+			if (de->d_name[0] == '.' || !strcmp(de->d_name, "hicolor"))
+				continue;
+			snprintf(path, sizeof path, "/usr/share/icons/%s", de->d_name);
+			found = theme_lookup(path, name, out, size);
+		}
+		closedir(dir);
+	}
+	if (found)
+		return true;
+	for (size_t e = 0; e < 3; e++) {
+		static const char *exts[] = { "png", "svg", "xpm" };
+
+		if (e == 2)
+			break;	/* xpm is not usable */
+		snprintf(path, sizeof path, "/usr/share/pixmaps/%s.%s", name, exts[e]);
+		if (file_exists(path)) {
+			snprintf(out, size, "%s", path);
+			return true;
+		}
+	}
+	return false;
+}
+
+/* resolve the icon of APP to a PNG file (SVG rendered with rsvg-convert) */
+static bool
+icon_png_path(const struct app *app, char *out, size_t size)
+{
+	char name[256], file[PATH_MAX], cached[PATH_MAX];
+	const char *ext;
+	pid_t pid;
+	int status;
+
+	if (app->icon[0] == '/')
+		snprintf(file, sizeof file, "%s", app->icon);
+	else {
+		if (app->icon[0])
+			snprintf(name, sizeof name, "%s", app->icon);
+		else if (!desktop_icon_name(app->command, name, sizeof name))
+			return false;
+		if (name[0] == '/')
+			snprintf(file, sizeof file, "%s", name);	/* Icon= with a path */
+		else if (!find_icon_file(name, file, sizeof file))
+			return false;
+	}
+	if (!file_exists(file))
+		return false;
+	ext = strrchr(file, '.');
+	if (ext && !strcasecmp(ext, ".png")) {
+		snprintf(out, size, "%s", file);
+		return true;
+	}
+	if (!ext || strcasecmp(ext, ".svg"))
+		return false;
+
+	/* render the SVG once into the cache */
+	snprintf(cached, sizeof cached, "%s/%s.png", cfg.icon_cache, app->name);
+	{
+		struct stat cs, ss;
+
+		if (stat(cached, &cs) == 0 && stat(file, &ss) == 0 && cs.st_mtime >= ss.st_mtime) {
+			snprintf(out, size, "%s", cached);
+			return true;
+		}
+	}
+	mkdir("/var/cache/weston-rail", 0755);
+	mkdir(cfg.icon_cache, 0755);
+	pid = fork();
+	if (pid == 0) {
+		int devnull = open("/dev/null", O_WRONLY);
+
+		if (devnull >= 0)
+			dup2(devnull, STDERR_FILENO);
+		execlp("rsvg-convert", "rsvg-convert", "-w", "64", "-h", "64", "-o", cached,
+		       file, (char *)NULL);
+		_exit(127);
+	}
+	if (pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+	    WEXITSTATUS(status) == 0 && file_exists(cached)) {
+		snprintf(out, size, "%s", cached);
+		return true;
+	}
+	return false;
+}
+
+static unsigned char *
+read_file(const char *path, size_t *len)
+{
+	FILE *f = fopen(path, "rb");
+	unsigned char *buf;
+	long n;
+
+	if (!f)
+		return NULL;
+	fseek(f, 0, SEEK_END);
+	n = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (n <= 0 || n > 8 * 1024 * 1024) {
+		fclose(f);
+		return NULL;
+	}
+	buf = malloc((size_t)n + 22);
+	if (buf && fread(buf, 1, (size_t)n, f) != (size_t)n) {
+		free(buf);
+		buf = NULL;
+	}
+	fclose(f);
+	*len = (size_t)n;
+	return buf;
+}
+
+/* ICO containing the PNG as is (supported since Windows Vista) */
+static unsigned char *
+png_to_ico(const unsigned char *png, size_t len, size_t *out_len)
+{
+	unsigned char *ico = malloc(len + 22);
+	unsigned w = 0, h = 0;
+
+	if (!ico)
+		return NULL;
+	if (len > 24 && !memcmp(png, "\x89PNG", 4)) {
+		w = (unsigned)png[16] << 24 | png[17] << 16 | png[18] << 8 | png[19];
+		h = (unsigned)png[20] << 24 | png[21] << 16 | png[22] << 8 | png[23];
+	}
+	memset(ico, 0, 22);
+	ico[2] = 1;			/* type: icon */
+	ico[4] = 1;			/* one image */
+	ico[6] = w >= 256 ? 0 : (unsigned char)w;
+	ico[7] = h >= 256 ? 0 : (unsigned char)h;
+	ico[10] = 1;			/* planes */
+	ico[12] = 32;			/* bpp */
+	ico[14] = len & 0xff;
+	ico[15] = (len >> 8) & 0xff;
+	ico[16] = (len >> 16) & 0xff;
+	ico[17] = (len >> 24) & 0xff;
+	ico[18] = 22;			/* offset */
+	memcpy(ico + 22, png, len);
+	*out_len = len + 22;
+	return ico;
+}
+
+/* ---- HTTP ----------------------------------------------------------- */
+
+struct buf {
+	char *data;
+	size_t len, cap;
+};
+
+static void
+buf_add(struct buf *b, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	for (;;) {
+		size_t room = b->cap - b->len;
+
+		va_start(ap, fmt);
+		n = vsnprintf(b->data ? b->data + b->len : NULL, b->data ? room : 0, fmt, ap);
+		va_end(ap);
+		if (n < 0)
+			return;
+		if (b->data && (size_t)n < room) {
+			b->len += (size_t)n;
+			return;
+		}
+		b->cap = (b->cap + (size_t)n + 1) * 2;
+		b->data = realloc(b->data, b->cap);
+		if (!b->data)
+			return;
+	}
+}
+
+static void
+xml_escape(struct buf *b, const char *s)
+{
+	for (; *s; s++) {
+		switch (*s) {
+		case '&': buf_add(b, "&amp;"); break;
+		case '<': buf_add(b, "&lt;"); break;
+		case '>': buf_add(b, "&gt;"); break;
+		case '"': buf_add(b, "&quot;"); break;
+		default: buf_add(b, "%c", *s); break;
+		}
+	}
+}
+
+static void
+send_all(SSL *ssl, const void *data, size_t len)
+{
+	const char *p = data;
+
+	while (len > 0) {
+		int n = SSL_write(ssl, p, len > INT_MAX ? INT_MAX : (int)len);
+
+		if (n <= 0)
+			return;
+		p += n;
+		len -= (size_t)n;
+	}
+}
+
+static void
+respond(SSL *ssl, bool head, int code, const char *type, const void *body, size_t len,
+	const char *extra_headers)
+{
+	char hdr[1024];
+	int n;
+	const char *text = code == 200 ? "OK" : code == 404 ? "Not Found" :
+			   code == 405 ? "Method Not Allowed" : "Bad Request";
+
+	n = snprintf(hdr, sizeof hdr,
+		     "HTTP/1.1 %d %s\r\n"
+		     "Content-Type: %s\r\n"
+		     "Content-Length: %zu\r\n"
+		     "Cache-Control: no-cache\r\n"
+		     "%s"
+		     "Connection: close\r\n\r\n",
+		     code, text, type, len, extra_headers ? extra_headers : "");
+	send_all(ssl, hdr, (size_t)n);
+	if (!head && body && len)
+		send_all(ssl, body, len);
+}
+
+static void
+iso_time(time_t t, char *out, size_t size)
+{
+	strftime(out, size, "%Y-%m-%dT%H:%M:%S.000Z", gmtime(&t));
+}
+
+/* the address clients connect to: [workspace] address, else the host
+ * the feed was fetched from */
+static void
+connect_address(const struct workspace *ws, const char *host, char *out, size_t size)
+{
+	char h[256];
+
+	if (ws->address[0]) {
+		snprintf(out, size, "%s", ws->address);
+		return;
+	}
+	snprintf(h, sizeof h, "%s", host);
+	if (h[0] != '[')
+		h[strcspn(h, ":")] = '\0';	/* drop the HTTPS port */
+	snprintf(out, size, "%s", h);
+}
+
+static void
+serve_feed(SSL *ssl, bool head, struct workspace *ws, const char *host)
+{
+	struct buf b = { 0 };
+	char now[40], updated[40], server[256];
+
+	iso_time(time(NULL), now, sizeof now);
+	iso_time(ws->mtime ? ws->mtime : time(NULL), updated, sizeof updated);
+	connect_address(ws, host, server, sizeof server);
+
+	buf_add(&b, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n"
+		    "<ResourceCollection PubDate=\"%s\" SchemaVersion=\"1.1\" "
+		    "xmlns=\"http://schemas.microsoft.com/ts/2007/05/tswf\">\r\n"
+		    "  <Publisher LastUpdated=\"%s\" Name=\"", now, updated);
+	xml_escape(&b, ws->name);
+	buf_add(&b, "\" ID=\"");
+	xml_escape(&b, server);
+	buf_add(&b, "\" Description=\"\">\r\n    <Resources>\r\n");
+	for (int i = 0; i < ws->n_apps; i++) {
+		struct app *a = &ws->apps[i];
+
+		buf_add(&b, "      <Resource ID=\"");
+		xml_escape(&b, a->name);
+		buf_add(&b, "\" Alias=\"");
+		xml_escape(&b, a->name);
+		buf_add(&b, "\" Title=\"");
+		xml_escape(&b, a->title);
+		buf_add(&b, "\" LastUpdated=\"%s\" Type=\"RemoteApp\">\r\n"
+			    "        <Icons>\r\n"
+			    "          <IconRaw FileType=\"Ico\" FileURL=\"https://%s/RDWeb/Feed/icon/",
+			updated, host);
+		xml_escape(&b, a->name);
+		buf_add(&b, ".ico\" />\r\n"
+			    "          <Icon32 Dimensions=\"32x32\" FileType=\"Png\" "
+			    "FileURL=\"https://%s/RDWeb/Feed/icon/", host);
+		xml_escape(&b, a->name);
+		buf_add(&b, ".png\" />\r\n"
+			    "        </Icons>\r\n"
+			    "        <FileExtensions />\r\n"
+			    "        <HostingTerminalServers>\r\n"
+			    "          <HostingTerminalServer>\r\n"
+			    "            <ResourceFile FileExtension=\".rdp\" "
+			    "URL=\"https://%s/RDWeb/Feed/rdp/", host);
+		xml_escape(&b, a->name);
+		buf_add(&b, ".rdp\" />\r\n            <TerminalServerRef Ref=\"");
+		xml_escape(&b, server);
+		buf_add(&b, "\" />\r\n          </HostingTerminalServer>\r\n"
+			    "        </HostingTerminalServers>\r\n"
+			    "      </Resource>\r\n");
+	}
+	buf_add(&b, "    </Resources>\r\n    <TerminalServers>\r\n"
+		    "      <TerminalServer ID=\"");
+	xml_escape(&b, server);
+	buf_add(&b, "\" Name=\"");
+	xml_escape(&b, server);
+	buf_add(&b, "\" LastUpdated=\"%s\" />\r\n"
+		    "    </TerminalServers>\r\n  </Publisher>\r\n</ResourceCollection>\r\n",
+		updated);
+	respond(ssl, head, 200, "application/x-msts-radc+xml; charset=utf-8", b.data, b.len,
+		NULL);
+	free(b.data);
+}
+
+static void
+serve_rdp(SSL *ssl, bool head, struct workspace *ws, const char *host, struct app *a)
+{
+	struct buf b = { 0 };
+	char server[256], disp[512];
+
+	connect_address(ws, host, server, sizeof server);
+	buf_add(&b,
+		"full address:s:%s\r\n"
+		"alternate full address:s:%s\r\n"
+		"remoteapplicationmode:i:1\r\n"
+		"remoteapplicationprogram:s:||%s\r\n"
+		"alternate shell:s:||%s\r\n"
+		"remoteapplicationname:s:%s\r\n"
+		"workspace id:s:%s\r\n"
+		"enablecredsspsupport:i:1\r\n"
+		"authentication level:i:%d\r\n"
+		"disableconnectionsharing:i:1\r\n"
+		"drivestoredirect:s:*\r\n"
+		"redirectprinters:i:1\r\n"
+		"redirectclipboard:i:1\r\n",
+		server, server, a->name, a->name, a->title, server, ws->auth_level);
+	if (ws->rdp_extra[0]) {
+		char extra[2048], *line, *save = NULL;
+
+		snprintf(extra, sizeof extra, "%s", ws->rdp_extra);
+		for (line = strtok_r(extra, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
+			buf_add(&b, "%s\r\n", line);
+	}
+	snprintf(disp, sizeof disp, "Content-Disposition: attachment; filename=\"%s.rdp\"\r\n",
+		 a->name);
+	respond(ssl, head, 200, "application/x-rdp", b.data, b.len, disp);
+	free(b.data);
+}
+
+static void
+serve_icon(SSL *ssl, bool head, struct app *a, bool ico)
+{
+	char png[PATH_MAX];
+	unsigned char *data = NULL, *out;
+	size_t len = 0, out_len = 0;
+
+	if (icon_png_path(a, png, sizeof png))
+		data = read_file(png, &len);
+	if (!data) {
+		respond(ssl, head, 404, "text/plain", "no icon\n", 8, NULL);
+		return;
+	}
+	if (ico) {
+		out = png_to_ico(data, len, &out_len);
+		free(data);
+		if (!out) {
+			respond(ssl, head, 404, "text/plain", "no icon\n", 8, NULL);
+			return;
+		}
+		respond(ssl, head, 200, "image/x-icon", out, out_len, NULL);
+		free(out);
+	} else {
+		respond(ssl, head, 200, "image/png", data, len, NULL);
+		free(data);
+	}
+}
+
+static bool
+ends_with_ci(const char *s, const char *suffix)
+{
+	size_t a = strlen(s), b = strlen(suffix);
+
+	return a >= b && !strcasecmp(s + a - b, suffix);
+}
+
+static void
+handle(SSL *ssl, const char *rhost)
+{
+	char req[8192], method[16], path[2048], host[256] = "";
+	int n, total = 0;
+	char *line, *save = NULL, *q;
+	struct workspace ws;
+	bool head;
+
+	/* read the request header */
+	while (total < (int)sizeof req - 1) {
+		n = SSL_read(ssl, req + total, (int)sizeof req - 1 - total);
+		if (n <= 0)
+			return;
+		total += n;
+		req[total] = '\0';
+		if (strstr(req, "\r\n\r\n"))
+			break;
+	}
+	if (sscanf(req, "%15s %2047s", method, path) != 2) {
+		respond(ssl, false, 400, "text/plain", "bad request\n", 12, NULL);
+		return;
+	}
+	for (line = strtok_r(req, "\r\n", &save); line; line = strtok_r(NULL, "\r\n", &save))
+		if (!strncasecmp(line, "Host:", 5))
+			snprintf(host, sizeof host, "%s", trim(line + 5));
+	if (!host[0] || strpbrk(host, "\"<>/ ")) {
+		respond(ssl, false, 400, "text/plain", "bad host\n", 9, NULL);
+		return;
+	}
+	head = !strcmp(method, "HEAD");
+	if (!head && strcmp(method, "GET")) {
+		respond(ssl, false, 405, "text/plain", "GET only\n", 9, NULL);
+		return;
+	}
+	q = strchr(path, '?');
+	if (q)
+		*q = '\0';
+	if (cfg.verbose)
+		logmsg("%s %s %s", rhost, method, path);
+
+	if (!load_workspace(&ws)) {
+		respond(ssl, head, 404, "text/plain", "no apps.conf\n", 13, NULL);
+		return;
+	}
+
+	/* feed: .../webfeed.aspx, .../webfeed, /RDWeb/Feed(/) */
+	if (ends_with_ci(path, "/webfeed.aspx") || ends_with_ci(path, "/webfeed") ||
+	    !strcasecmp(path, "/RDWeb/Feed") || !strcasecmp(path, "/RDWeb/Feed/")) {
+		serve_feed(ssl, head, &ws, host);
+	} else if (!strncasecmp(path, "/RDWeb/Feed/rdp/", 16) && ends_with_ci(path, ".rdp")) {
+		char name[128];
+		struct app *a;
+
+		snprintf(name, sizeof name, "%.*s", (int)(strlen(path) - 16 - 4), path + 16);
+		a = find_app(&ws, name);
+		if (a)
+			serve_rdp(ssl, head, &ws, host, a);
+		else
+			respond(ssl, head, 404, "text/plain", "not published\n", 14, NULL);
+	} else if (!strncasecmp(path, "/RDWeb/Feed/icon/", 17) &&
+		   (ends_with_ci(path, ".png") || ends_with_ci(path, ".ico"))) {
+		char name[128];
+		struct app *a;
+
+		snprintf(name, sizeof name, "%.*s", (int)(strlen(path) - 17 - 4), path + 17);
+		a = find_app(&ws, name);
+		if (a)
+			serve_icon(ssl, head, a, ends_with_ci(path, ".ico"));
+		else
+			respond(ssl, head, 404, "text/plain", "not published\n", 14, NULL);
+	} else {
+		respond(ssl, head, 404, "text/plain", "not found\n", 10, NULL);
+	}
+	free(ws.apps);
+}
+
+static void *
+connection_thread(void *data)
+{
+	int fd = (int)(intptr_t)data;
+	struct sockaddr_storage ss;
+	socklen_t sl = sizeof ss;
+	char rhost[INET6_ADDRSTRLEN] = "?";
+	struct timeval tv = { .tv_sec = 15 };
+	SSL *ssl;
+
+	if (getpeername(fd, (struct sockaddr *)&ss, &sl) == 0) {
+		if (ss.ss_family == AF_INET)
+			inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr, rhost, sizeof rhost);
+		else
+			inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr, rhost, sizeof rhost);
+	}
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+	ssl = SSL_new(ssl_ctx);
+	if (ssl) {
+		SSL_set_fd(ssl, fd);
+		if (SSL_accept(ssl) == 1)
+			handle(ssl, rhost);
+		SSL_shutdown(ssl);
+		SSL_free(ssl);
+	}
+	close(fd);
+	return NULL;
+}
+
+int
+main(int argc, char *argv[])
+{
+	static const struct option opts[] = {
+		{ "port", required_argument, NULL, 'p' },
+		{ "cert", required_argument, NULL, 'c' },
+		{ "key", required_argument, NULL, 'k' },
+		{ "apps", required_argument, NULL, 'a' },
+		{ "verbose", no_argument, NULL, 'v' },
+		{ "help", no_argument, NULL, 'h' },
+		{ NULL, 0, NULL, 0 }
+	};
+	struct sockaddr_in6 a6 = { .sin6_family = AF_INET6 };
+	struct sockaddr_in a4 = { .sin_family = AF_INET };
+	int lfd, on = 1, off = 0, opt;
+	bool bound = false;
+
+	while ((opt = getopt_long(argc, argv, "p:c:k:a:vh", opts, NULL)) != -1) {
+		switch (opt) {
+		case 'p': cfg.port = atoi(optarg); break;
+		case 'c': cfg.cert = optarg; break;
+		case 'k': cfg.key = optarg; break;
+		case 'a': cfg.apps_conf = optarg; break;
+		case 'v': cfg.verbose = true; break;
+		default:
+			fprintf(stderr,
+				"usage: weston-rail-feed [--port=443] [--cert=FILE] [--key=FILE]\n"
+				"                        [--apps=/etc/weston-rail/apps.conf] [-v]\n");
+			return opt == 'h' ? 0 : 2;
+		}
+	}
+	signal(SIGPIPE, SIG_IGN);
+	setvbuf(stderr, NULL, _IOLBF, 0);
+
+	ssl_ctx = SSL_CTX_new(TLS_server_method());
+	if (!ssl_ctx ||
+	    SSL_CTX_use_certificate_chain_file(ssl_ctx, cfg.cert) != 1 ||
+	    SSL_CTX_use_PrivateKey_file(ssl_ctx, cfg.key, SSL_FILETYPE_PEM) != 1) {
+		logmsg("cannot load %s / %s (weston-rail-broker creates them on its first "
+		       "start)", cfg.cert, cfg.key);
+		return 1;
+	}
+	SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
+
+	lfd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (lfd >= 0) {
+		setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+		setsockopt(lfd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof off);
+		a6.sin6_addr = in6addr_any;
+		a6.sin6_port = htons(cfg.port);
+		bound = bind(lfd, (struct sockaddr *)&a6, sizeof a6) == 0;
+		if (!bound) {
+			close(lfd);
+			lfd = -1;
+		}
+	}
+	if (lfd < 0) {
+		lfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+		if (lfd < 0)
+			return 1;
+		setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+		a4.sin_addr.s_addr = htonl(INADDR_ANY);
+		a4.sin_port = htons(cfg.port);
+		bound = bind(lfd, (struct sockaddr *)&a4, sizeof a4) == 0;
+	}
+	if (!bound || listen(lfd, 32) < 0) {
+		logmsg("cannot listen on port %d: %s", cfg.port, strerror(errno));
+		return 1;
+	}
+	logmsg("weston-rail-feed listening on port %d, feed: https://<server>%s/RDWeb/Feed/webfeed.aspx",
+	       cfg.port, cfg.port == 443 ? "" : ":<port>");
+
+	for (;;) {
+		pthread_t tid;
+		int fd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
+
+		if (fd < 0)
+			continue;
+		if (pthread_create(&tid, NULL, connection_thread, (void *)(intptr_t)fd) != 0) {
+			close(fd);
+			continue;
+		}
+		pthread_detach(tid);
+	}
+}

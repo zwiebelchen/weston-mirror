@@ -60,6 +60,7 @@ RUNTIME=(
 	openssl                 # TLS-Zertifikat des Session-Brokers
 	dbus-user-session       # dbus-run-session fuer die Sessions (Broker)
 	adwaita-icon-theme      # Maus-Cursor und Symbole fuer die Anwendungen
+	librsvg2-bin            # rsvg-convert: SVG-Symbole fuer den Arbeitsbereich-Feed
 )
 
 strip_comments() {

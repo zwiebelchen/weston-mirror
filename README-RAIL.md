@@ -27,6 +27,7 @@ Getestet mit Windows `mstsc` gegen einen Debian-13-LXC-Container auf Proxmox.
 | Mikrofon (audin) | fehlt (unter FreeRDP 3 noch nicht portiert) |
 | Passwortwechsel → NT-Hash automatisch nachziehen | ja, PAM-Modul `pam_weston_rail.so` |
 | Linux-Client `xfreerdp3` | startet, Fensterinhalt bleibt schwarz (Client-Problem) |
+| Arbeitsbereich (Feed) für Windows-Startmenü und Windows App | ja, `weston-rail-feed` (siehe unten) |
 | App-Liste an den Client publizieren (`rdpapplist`) | nicht verfügbar (Microsoft-eigener Kanal) |
 
 ### Voraussetzungen im Proxmox-LXC
@@ -242,6 +243,45 @@ Optionen: `weston-rail-broker --help` (Port, Zertifikat, Weston-Pfad,
 Leerlaufzeit). Für Tests ohne Broker funktioniert der direkte Start von
 Weston wie oben weiterhin.
 
+## Arbeitsbereich: Programme im Startmenü und in der Windows App
+
+`weston-rail-feed` stellt die veröffentlichten Programme aus
+`/etc/weston-rail/apps.conf` als Arbeitsbereich im Format von RD Web Access
+bereit – mit Namen, Symbolen und fertigen Verbindungsdateien:
+
+```bash
+sudo systemctl enable --now weston-rail-feed      # HTTPS auf Port 443
+```
+
+Feed-URL: `https://SERVER/RDWeb/Feed/webfeed.aspx`
+
+| Client | Einrichten |
+|---|---|
+| Windows 10/11 | Systemsteuerung → **RemoteApp- und Desktopverbindungen** → „Auf RemoteApp und Desktops zugreifen“ → Feed-URL. Die Programme erscheinen im Startmenü unter „Arbeitsressourcen“ und werden automatisch aktualisiert. Per GPO verteilbar: Benutzerkonfiguration → Administrative Vorlagen → Windows-Komponenten → Remotedesktopdienste → RemoteApp- und Desktopverbindungen → „Standardverbindungs-URL angeben“. |
+| Windows App auf macOS, iOS/iPadOS, Android/ChromeOS | **+** → **Arbeitsbereich hinzufügen** → Feed-URL oder E-Mail-Adresse (siehe unten) |
+
+Die **Windows App unter Windows** kann derzeit keine RDS-Arbeitsbereiche
+abonnieren (Microsoft unterstützt das dort nur für Azure Virtual Desktop und
+Windows 365). Unter Windows übernimmt das die eingebaute Funktion
+„RemoteApp- und Desktopverbindungen“.
+
+Wichtig:
+
+- **Windows verlangt für den Feed ein vertrauenswürdiges HTTPS-Zertifikat**
+  (die mobilen Apps können ein unbekanntes Zertifikat akzeptieren). Ein
+  eigenes Zertifikat, z. B. Let's Encrypt, per
+  `sudo systemctl edit weston-rail-feed` →
+  `Environment=FEED_ARGS=--cert=/pfad/fullchain.pem --key=/pfad/privkey.pem`.
+- Der Feed braucht keine Anmeldung, er listet nur die veröffentlichten
+  Programme. Angemeldet wird beim Start eines Programms (NLA am Broker).
+- Einstellungen im Abschnitt `[workspace]` der `apps.conf`: `name`
+  (angezeigter Name), `address` (Server für die Verbindung, Standard: der Name,
+  unter dem der Feed abgerufen wurde), `authentication-level`, zusätzliche
+  `.rdp`-Zeilen mit `rdp=…`. Pro Programm `title` und `icon` (Name aus dem
+  Icon-Theme oder Pfad; ohne Angabe aus der `.desktop`-Datei des Programms).
+- Anmeldung per E-Mail-Adresse in der Windows App: DNS-TXT-Eintrag
+  `_msradc.example.org` mit dem Wert `https://SERVER/RDWeb/Feed`.
+
 ## Allowlist: veröffentlichte Programme
 
 Ein Client kann nur Programme starten, die in `/etc/weston-rail/apps.conf`
@@ -382,6 +422,17 @@ drivestoredirect:s:*
 redirectprinters:i:1
 ```
 
+## Vorgemerkt
+
+- **Ton-Ausgabe**: eigene Audio-Anbindung (PipeWire/PulseAudio), da die
+  WSLg-Senke unter Debian fehlt; danach Mikrofon (audin für FreeRDP 3)
+- **Active Directory / Kerberos testen**, z. B. mit dem Samba-DC aus ice2k;
+  dabei NT-Hashes direkt aus Samba beziehen statt aus `ntlm.sam`
+- **Verwaltungs-Snap-in für ice2k** (veröffentlichte Programme, Sessions,
+  Broker-Dienst) auf Basis von `weston-rail-sessions --json` und `apps.conf`
+- `.rdp`-Dateien im Feed signieren (sonst warnt Windows beim Start vor einem
+  unbekannten Herausgeber)
+
 ## Änderungen gegenüber microsoft/weston-mirror
 
 - Port auf die FreeRDP-3-API (Zertifikate, RFX, Clipboard, Tastatur, WinPR),
@@ -391,6 +442,8 @@ redirectprinters:i:1
 - Geräteumleitung (rdpdr): Laufwerke per FUSE, Drucker per CUPS (XPS);
   korrigierte Kopie des FreeRDP-rdpdr-Servers unter `libweston/backend-rdp/rdpdr/`
 - Session-Broker `weston-rail-broker` (PAM, NLA, Umleitung, eine Weston-Instanz
-  pro User) und `weston-rail-passwd`
+  pro User), `weston-rail-passwd`, `pam_weston_rail.so`, `weston-rail-sessions`
+- Arbeitsbereich-Feed `weston-rail-feed` (RemoteApp- und Desktopverbindungen,
+  Windows App)
 - audin unter FreeRDP 3 als Stub, Xwayland mit `-listenfd`
 - Build- und Installationsskripte

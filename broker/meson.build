@@ -36,6 +36,26 @@ executable(
 	install_dir: join_paths(dir_prefix, get_option('sbindir')),
 )
 
+dep_openssl_feed = dependency('openssl', required: false)
+if dep_openssl_feed.found()
+	executable(
+		'weston-rail-feed',
+		'weston-rail-feed.c',
+		include_directories: common_inc,
+		dependencies: [ dep_openssl_feed, dep_threads ],
+		install: true,
+		install_dir: join_paths(dir_prefix, get_option('sbindir')),
+	)
+	feed_service_conf = configuration_data()
+	feed_service_conf.set('sbindir', join_paths(dir_prefix, get_option('sbindir')))
+	configure_file(
+		input: 'weston-rail-feed.service.in',
+		output: 'weston-rail-feed.service',
+		configuration: feed_service_conf,
+		install_dir: join_paths(dir_prefix, 'lib', 'systemd', 'system'),
+	)
+endif
+
 shared_module(
 	'pam_weston_rail',
 	'pam_weston_rail.c',
