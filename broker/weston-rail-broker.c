@@ -47,6 +47,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -395,6 +396,19 @@ pam_open_thread(void *data)
 	return NULL;
 }
 
+static volatile pid_t keeper_child;
+
+/* weston-rail-sessions --logoff: end the user's weston (its whole process
+ * group: dbus-run-session, dbus-daemon, weston). The applications notice
+ * that their compositor is gone and exit. */
+static void
+keeper_sigterm(int sig)
+{
+	(void)sig;
+	if (keeper_child > 0)
+		kill(-keeper_child, SIGTERM);
+}
+
 /* runs in the session keeper process (root), never returns */
 static void
 session_keeper(const struct passwd *pw, const char *ctl)
@@ -473,9 +487,13 @@ session_keeper(const struct passwd *pw, const char *ctl)
 	snprintf(logpath, sizeof logpath, "%s/weston-rail.log", rundir);
 	read_default_lang(lang, sizeof lang);
 
+	signal(SIGTERM, keeper_sigterm);
 	pid = fork();
 	if (pid == 0) {
 		char *argv[16];
+
+		setpgid(0, 0);
+		signal(SIGTERM, SIG_DFL);
 		char cert_opt[160], key_opt[160], log_opt[160], idle[16];
 		int argc = 0, fd, i;
 
@@ -541,9 +559,12 @@ session_keeper(const struct passwd *pw, const char *ctl)
 		_exit(127);
 	}
 
-	if (pid > 0)
+	if (pid > 0) {
+		keeper_child = pid;
+		setpgid(pid, pid);	/* also from here, avoids a race */
 		while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
 			;
+	}
 	unlink(ctl);
 	{
 		char sam[128];
@@ -1164,6 +1185,159 @@ out:
 	freerdp_peer_free(peer);
 }
 
+
+/* ------------------------------------------------------------------ */
+/* admin interface: /run/weston-rail-broker.sock (root only)           */
+/* ------------------------------------------------------------------ */
+
+#define ADMIN_SOCKET "/run/weston-rail-broker.sock"
+
+/* ask a session's weston: client connected? programs running? */
+static bool
+session_status(const char *ctl, int *connected, int *apps)
+{
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	struct timeval tv = { .tv_sec = 1 };
+	char byte = 'S', reply[64];
+	int s;
+	ssize_t n;
+
+	*connected = *apps = -1;
+	snprintf(addr.sun_path, sizeof addr.sun_path, "%s", ctl);
+	s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (s < 0)
+		return false;
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+	setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+	if (connect(s, (struct sockaddr *)&addr, sizeof addr) < 0 ||
+	    write(s, &byte, 1) != 1) {
+		close(s);
+		return false;
+	}
+	n = read(s, reply, sizeof reply - 1);
+	close(s);
+	if (n <= 0)
+		return false;
+	reply[n] = '\0';
+	return sscanf(reply, "STATUS connected=%d apps=%d", connected, apps) == 2;
+}
+
+static void
+admin_reply(int fd, const char *fmt, ...)
+{
+	char buf[512];
+	va_list ap;
+	int len;
+
+	va_start(ap, fmt);
+	len = vsnprintf(buf, sizeof buf, fmt, ap);
+	va_end(ap);
+	if (len > 0 && write(fd, buf, (size_t)len) < 0)
+		return;
+}
+
+static void
+admin_list(int fd)
+{
+	struct snap {
+		char user[64];
+		unsigned uid;
+		int pid;
+		long started;
+		char ctl[108];
+	} snaps[256];
+	struct session *s;
+	int n = 0, i;
+
+	pthread_mutex_lock(&lock);
+	for (s = sessions; s && n < 256; s = s->next, n++) {
+		snprintf(snaps[n].user, sizeof snaps[n].user, "%s", s->user);
+		snaps[n].uid = (unsigned)s->uid;
+		snaps[n].pid = (int)s->pid;
+		snaps[n].started = (long)s->started;
+		memcpy(snaps[n].ctl, s->ctl, sizeof snaps[n].ctl);
+	}
+	pthread_mutex_unlock(&lock);
+
+	/* user uid pid started(epoch) connected(1/0/-1) apps(-1 unknown) */
+	for (i = 0; i < n; i++) {
+		int connected, apps;
+
+		session_status(snaps[i].ctl, &connected, &apps);
+		admin_reply(fd, "%s\t%u\t%d\t%ld\t%d\t%d\n", snaps[i].user, snaps[i].uid,
+			    snaps[i].pid, snaps[i].started, connected, apps);
+	}
+	admin_reply(fd, "END\n");
+}
+
+static void
+admin_logoff(int fd, const char *user)
+{
+	struct session *s;
+	pid_t pid = 0;
+
+	pthread_mutex_lock(&lock);
+	s = session_find_locked(user);
+	if (s)
+		pid = s->pid;
+	pthread_mutex_unlock(&lock);
+	if (!pid) {
+		admin_reply(fd, "ERR no session for %s\n", user);
+		return;
+	}
+	logmsg("session for %s: logoff requested by the administrator", user);
+	kill(pid, SIGTERM);	/* the keeper ends weston's process group */
+	admin_reply(fd, "OK\n");
+}
+
+static void *
+admin_thread(void *data)
+{
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	int lfd;
+
+	(void)data;
+	unlink(ADMIN_SOCKET);
+	lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	snprintf(addr.sun_path, sizeof addr.sun_path, "%s", ADMIN_SOCKET);
+	if (lfd < 0 || bind(lfd, (struct sockaddr *)&addr, sizeof addr) < 0 ||
+	    listen(lfd, 8) < 0) {
+		logmsg("admin interface unavailable: %s", strerror(errno));
+		return NULL;
+	}
+	chmod(ADMIN_SOCKET, 0600);
+
+	for (;;) {
+		struct ucred cred;
+		socklen_t cl = sizeof cred;
+		struct timeval tv = { .tv_sec = 5 };
+		char line[256];
+		ssize_t n;
+		int fd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
+
+		if (fd < 0)
+			continue;
+		if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &cl) < 0 || cred.uid != 0) {
+			close(fd);
+			continue;
+		}
+		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+		n = read(fd, line, sizeof line - 1);
+		if (n > 0) {
+			line[n] = '\0';
+			line[strcspn(line, "\r\n")] = '\0';
+			if (!strcmp(line, "LIST"))
+				admin_list(fd);
+			else if (!strncmp(line, "LOGOFF ", 7) && valid_username(line + 7))
+				admin_logoff(fd, line + 7);
+			else
+				admin_reply(fd, "ERR unknown command\n");
+		}
+		close(fd);
+	}
+	return NULL;
+}
+
 /* ------------------------------------------------------------------ */
 /* connection dispatch                                                 */
 /* ------------------------------------------------------------------ */
@@ -1486,6 +1660,8 @@ main(int argc, char *argv[])
 		return 1;
 	}
 	pthread_create(&tid, NULL, reaper_thread, NULL);
+	pthread_detach(tid);
+	pthread_create(&tid, NULL, admin_thread, NULL);
 	pthread_detach(tid);
 	logmsg("weston-rail-broker listening on port %d", cfg.port);
 	logmsg("NLA: %s%s%s; login without NLA: %s",

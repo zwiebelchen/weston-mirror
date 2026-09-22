@@ -28,6 +28,14 @@ executable(
 	install_dir: join_paths(dir_prefix, get_option('sbindir')),
 )
 
+executable(
+	'weston-rail-sessions',
+	'weston-rail-sessions.c',
+	include_directories: common_inc,
+	install: true,
+	install_dir: join_paths(dir_prefix, get_option('sbindir')),
+)
+
 shared_module(
 	'pam_weston_rail',
 	'pam_weston_rail.c',

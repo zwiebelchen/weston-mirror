@@ -134,6 +134,19 @@ drivestoredirect:s:*
 redirectprinters:i:1
 ```
 
+### Sessions verwalten
+
+```bash
+sudo weston-rail-sessions                 # Tabelle: User, Beginn, verbunden/getrennt, Programme
+sudo weston-rail-sessions --json          # dasselbe als JSON (für Verwaltungsprogramme)
+sudo weston-rail-sessions --logoff lars   # Session beenden (Weston und seine Programme)
+```
+
+Eine *getrennte* Session läuft mit ihren Programmen weiter, bis der User sich
+wieder verbindet; sie endet von selbst, sobald keine Programme mehr laufen.
+Schnittstelle: `/run/weston-rail-broker.sock` (nur root), Befehle `LIST` und
+`LOGOFF <user>`.
+
 ### Anmeldung: NLA oder ohne NLA
 
 Der Broker kann beides. Mit **NLA** fragt mstsc wie bei Windows-RDS selbst

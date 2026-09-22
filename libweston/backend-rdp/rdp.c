@@ -2438,7 +2438,17 @@ rdp_control_activity(int fd, uint32_t mask, void *data)
 			memcpy(&peer_fd, CMSG_DATA(cmsg), sizeof(int));
 	}
 	if (peer_fd < 0) {
-		weston_log("RDP control: no connection received\n");
+		if (n == 1 && byte == 'S') {
+			/* status query from the session broker */
+			char reply[64];
+			int len = snprintf(reply, sizeof reply, "STATUS connected=%d apps=%d\n",
+					   b->rdp_peer ? 1 : 0, wl_list_length(&b->exec_clients));
+
+			n = write(conn, reply, len);
+			(void)n;
+		} else {
+			weston_log("RDP control: no connection received\n");
+		}
 		close(conn);
 		return 1;
 	}
