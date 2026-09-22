@@ -381,8 +381,30 @@ find_icon_file(const char *name, char *out, size_t size)
 }
 
 /* resolve the icon of APP to a PNG file (SVG rendered with rsvg-convert) */
+static bool icon_png_path_for(const struct app *app, char *out, size_t size);
+
+/* never leave a program without icon: clients may skip the whole entry */
 static bool
 icon_png_path(const struct app *app, char *out, size_t size)
+{
+	static const char *generic[] = { "application-x-executable", "applications-other",
+					 "system-run", "utilities-terminal" };
+	struct app tmp;
+
+	if (icon_png_path_for(app, out, size))
+		return true;
+	for (size_t i = 0; i < sizeof generic / sizeof generic[0]; i++) {
+		tmp = *app;
+		snprintf(tmp.icon, sizeof tmp.icon, "%s", generic[i]);
+		snprintf(tmp.name, sizeof tmp.name, "_generic-%s", generic[i]);
+		if (icon_png_path_for(&tmp, out, size))
+			return true;
+	}
+	return false;
+}
+
+static bool
+icon_png_path_for(const struct app *app, char *out, size_t size)
 {
 	char name[256], file[PATH_MAX], cached[PATH_MAX];
 	const char *ext;
@@ -440,6 +462,9 @@ icon_png_path(const struct app *app, char *out, size_t size)
 	}
 	return false;
 }
+
+/* 32x32 generic window icon, used when no icon theme provides one */
+static const unsigned char builtin_icon_png[] = { 0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0x00,0x00,0x00,0x0d,0x49,0x48,0x44,0x52,0x00,0x00,0x00,0x20,0x00,0x00,0x00,0x20,0x08,0x06,0x00,0x00,0x00,0x73,0x7a,0x7a,0xf4,0x00,0x00,0x00,0x3e,0x49,0x44,0x41,0x54,0x78,0xda,0xed,0xd7,0x31,0x11,0x00,0x20,0x0c,0x00,0xb1,0x7a,0xaa,0x27,0xd4,0x22,0xa6,0x0e,0xc0,0x45,0xe9,0x1d,0x19,0x7e,0xcf,0xfa,0x91,0xb9,0xce,0xcb,0x62,0x0e,0x60,0xed,0xde,0x00,0x00,0xc6,0x01,0xaa,0xaa,0x35,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x80,0x79,0x80,0x6f,0xef,0xf8,0x02,0xb9,0x23,0x6a,0xbd,0xb1,0xe0,0x54,0xa0,0x00,0x00,0x00,0x00,0x49,0x45,0x4e,0x44,0xae,0x42,0x60,0x82 };
 
 static unsigned char *
 read_file(const char *path, size_t *len)
@@ -603,6 +628,12 @@ connect_address(const struct workspace *ws, const char *host, char *out, size_t 
 	snprintf(out, size, "%s", h);
 }
 
+/*
+ * Links in the feed are root relative ("/RDWeb/Feed/..."), like RD Web
+ * Access and RAWeb: the client resolves them against the feed URL it
+ * used, so they stay correct behind a reverse proxy whatever Host header
+ * reaches us.
+ */
 static void
 serve_feed(struct conn *ssl, bool head, struct workspace *ws, const char *host)
 {
@@ -632,12 +663,12 @@ serve_feed(struct conn *ssl, bool head, struct workspace *ws, const char *host)
 		xml_escape(&b, a->title);
 		buf_add(&b, "\" LastUpdated=\"%s\" Type=\"RemoteApp\">\r\n"
 			    "        <Icons>\r\n"
-			    "          <IconRaw FileType=\"Ico\" FileURL=\"https://%s/RDWeb/Feed/icon/",
-			updated, host);
+			    "          <IconRaw FileType=\"Ico\" FileURL=\"/RDWeb/Feed/icon/",
+			updated);
 		xml_escape(&b, a->name);
 		buf_add(&b, ".ico\" />\r\n"
 			    "          <Icon32 Dimensions=\"32x32\" FileType=\"Png\" "
-			    "FileURL=\"https://%s/RDWeb/Feed/icon/", host);
+			    "FileURL=\"/RDWeb/Feed/icon/");
 		xml_escape(&b, a->name);
 		buf_add(&b, ".png\" />\r\n"
 			    "        </Icons>\r\n"
@@ -645,7 +676,7 @@ serve_feed(struct conn *ssl, bool head, struct workspace *ws, const char *host)
 			    "        <HostingTerminalServers>\r\n"
 			    "          <HostingTerminalServer>\r\n"
 			    "            <ResourceFile FileExtension=\".rdp\" "
-			    "URL=\"https://%s/RDWeb/Feed/rdp/", host);
+			    "URL=\"/RDWeb/Feed/rdp/");
 		xml_escape(&b, a->name);
 		buf_add(&b, ".rdp\" />\r\n            <TerminalServerRef Ref=\"");
 		xml_escape(&b, server);
@@ -711,8 +742,13 @@ serve_icon(struct conn *ssl, bool head, struct app *a, bool ico)
 	if (icon_png_path(a, png, sizeof png))
 		data = read_file(png, &len);
 	if (!data) {
-		respond(ssl, head, 404, "text/plain", "no icon\n", 8, NULL);
-		return;
+		len = sizeof builtin_icon_png;
+		data = malloc(len);
+		if (!data) {
+			respond(ssl, head, 404, "text/plain", "no icon\n", 8, NULL);
+			return;
+		}
+		memcpy(data, builtin_icon_png, len);
 	}
 	if (ico) {
 		out = png_to_ico(data, len, &out_len);
