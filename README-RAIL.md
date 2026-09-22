@@ -18,7 +18,7 @@ Getestet mit Windows `mstsc` gegen einen Debian-13-LXC-Container auf Proxmox.
 | Mehrere Instanzen einer Anwendung | ja |
 | Session pro User, parallel mehrere User | ja, `weston-rail-broker` |
 | Anmeldung mit Passwortabfrage in mstsc (NLA) | ja, NTLM über NT-Hash-Datei |
-| Active Directory (Kerberos) | eingebaut, noch nicht getestet |
+| Active Directory (Kerberos) | ja, getestet mit Samba-AD (Funktionsebene 2003) und xfreerdp3 |
 | Allowlist veröffentlichter Programme | ja, `/etc/weston-rail/apps.conf` |
 | Laufwerke des Clients | ja: lesen, speichern, umbenennen, löschen (FUSE) |
 | Drucken auf Client-Druckern | ja, über den Windows-Treiber des Clients (XPS) |
@@ -185,22 +185,37 @@ echo "password	optional	$M" | sudo tee -a /etc/pam.d/common-password
 (Nicht direkt hinter die `pam_unix`-Zeile setzen: deren `success=1` würde
 sonst die falsche Zeile überspringen.)
 
-**Mit Active Directory – Kerberos (noch nicht getestet).** Server in die
-Domäne aufnehmen (z. B. `realm join`), Dienstprinzipal
-`TERMSRV/<fqdn>` anlegen und dessen Schlüssel nach
-`/etc/weston-rail/krb5.keytab` (nur root) exportieren, z. B.:
+**Mit Active Directory – Kerberos.** Der Container tritt der Domäne bei
+(sssd), ein Dienstkonto trägt den Dienstnamen `TERMSRV/<Name, mit dem die
+Clients verbinden>`, dessen Keytab liegt in `/etc/weston-rail/krb5.keytab`:
 
 ```bash
-sudo adcli update --service-name=TERMSRV
-sudo ktutil   # TERMSRV/*-Einträge aus /etc/krb5.keytab nach /etc/weston-rail/krb5.keytab
+# Container: DNS auf den DC, dann Beitritt
+sudo apt install realmd sssd sssd-tools adcli krb5-user libnss-sss libpam-sss oddjob oddjob-mkhomedir
+sudo realm join -U Administrator ad.example.org
+#   /etc/sssd/sssd.conf: use_fully_qualified_names = False, default_shell = /bin/bash
+sudo pam-auth-update --enable mkhomedir
+
+# DC (Samba): Dienstkonto, Dienstname, Keytab
+samba-tool user create svc-rdp --random-password
+samba-tool user setexpiry svc-rdp --noexpiry
+samba-tool spn add TERMSRV/rdp.example.org svc-rdp
+samba-tool domain exportkeytab /root/rdp.keytab --principal=TERMSRV/rdp.example.org
+#   -> nach /etc/weston-rail/krb5.keytab im Container (root, 600)
 ```
 
-Dann meldet mstsc sich mit dem Windows-Konto an, verbunden über den
-vollqualifizierten Namen. Heißen die Linux-Konten `lars@zwiebelchen.org`
-(sssd mit vollqualifizierten Namen), dem Broker `--user-map=upn` mitgeben,
-bei `ZWIEBELCHEN\lars` `--user-map=netbios`. Die Verbindung nach der
-Umleitung läuft per NTLM mit dem Hash des gerade angemeldeten Users – die
-Domäne darf NTLM also nicht komplett verbieten.
+Ein eigenes Dienstkonto statt des Computerkontos, weil sssd dessen Passwort
+regelmäßig ändert und die Keytab dann veraltet. Heißen die Linux-Konten
+`lars@realm` (vollqualifizierte Namen), dem Broker `--user-map=upn` mitgeben.
+
+Hinweise aus dem Test:
+- Bei Funktionsebene 2000/2003 erzeugt Samba für Konten nur RC4-Schlüssel
+  (kein AES). Windows 10 akzeptiert das; bei neueren Windows-Versionen kann
+  RC4 abgeschaltet sein, dann weicht die Anmeldung auf NTLM aus.
+- Die Verbindung nach der Umleitung läuft immer per NTLM mit dem Hash des
+  gerade angemeldeten Users; die Domäne darf NTLM nicht komplett verbieten.
+- Die Meldung `krb5_get_init_creds_keytab (Client 'TERMSRV/…' not found)` im
+  Broker-Log ist harmlos.
 
 Beides lässt sich kombinieren: Kerberos für Domänen-Clients, die NT-Hash-Datei
 für alle anderen. Broker-Optionen: `--sam`, `--keytab`, `--user-map`,
@@ -515,8 +530,8 @@ redirectprinters:i:1
 
 - **Ton-Ausgabe**: eigene Audio-Anbindung (PipeWire/PulseAudio), da die
   WSLg-Senke unter Debian fehlt; danach Mikrofon (audin für FreeRDP 3)
-- **Active Directory / Kerberos testen**, z. B. mit dem Samba-DC aus ice2k;
-  dabei NT-Hashes direkt aus Samba beziehen statt aus `ntlm.sam`
+- NTLM-Rückfall für AD-Benutzer: NT-Hashes direkt vom Samba-DC beziehen
+  statt aus `ntlm.sam`
 - **Verwaltungs-Snap-in für ice2k** (veröffentlichte Programme, Sessions,
   Broker-Dienst) auf Basis von `weston-rail-sessions --json` und `apps.conf`
 - Let's-Encrypt-Zertifikat automatisch von der OPNsense in den Container

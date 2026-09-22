@@ -2077,8 +2077,15 @@ rdp_peer_init(freerdp_peer *client, struct rdp_backend *b)
 		const char *sam = getenv("WESTON_RDP_NLA_SAM");
 
 		if (sam && access(sam, R_OK) == 0 &&
-		    freerdp_settings_set_string(settings, FreeRDP_NtlmSamFile, sam))
+		    freerdp_settings_set_string(settings, FreeRDP_NtlmSamFile, sam)) {
 			settings->NlaSecurity = TRUE;
+			/* only NTLM here: after a Kerberos login at the broker the
+			 * client tries Kerberos first again, and without a keytab
+			 * WinPR aborts instead of falling back unless Kerberos is
+			 * excluded from the offered packages */
+			freerdp_settings_set_string(settings, FreeRDP_AuthenticationPackageList,
+						    "ntlm,!kerberos");
+		}
 	}
 
 	if (!client->Initialize(client)) {

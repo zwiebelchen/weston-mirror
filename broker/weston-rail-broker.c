@@ -781,10 +781,33 @@ write_session_sam(const struct login *login)
 	fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
 	if (fd < 0)
 		return;
-	/* the client's user name and, for NTLM's domain fallback, without domain */
-	snprintf(line, sizeof line, "%s:::%s:::\n", login->client_user, login->nthash);
-	if (write(fd, line, strlen(line)) != (ssize_t)strlen(line) ||
-	    fchown(fd, pw->pw_uid, pw->pw_gid) < 0) {
+	/*
+	 * NTLM looks the user up by the name the client sends, which depends
+	 * on how it was typed: "lars", "lars@realm" (then the user part may be
+	 * sent alone) or "DOMAIN\lars". Write every variant, all with the
+	 * user's own hash; the domain is left empty (WinPR falls back to it).
+	 */
+	{
+		char variants[4][128];
+		int nv = 0, v;
+		const char *cu = login->client_user;
+		const char *at = strchr(cu, '@'), *bs = strrchr(cu, '\\');
+
+		snprintf(variants[nv++], sizeof variants[0], "%s", bs ? bs + 1 : cu);
+		if (at && !bs)
+			snprintf(variants[nv++], sizeof variants[0], "%.*s", (int)(at - cu), cu);
+		if (strcmp(variants[0], login->user) && (nv < 2 || strcmp(variants[1], login->user)))
+			snprintf(variants[nv++], sizeof variants[0], "%s", login->user);
+		for (v = 0; v < nv; v++) {
+			snprintf(line, sizeof line, "%s:::%s:::\n", variants[v], login->nthash);
+			if (write(fd, line, strlen(line)) != (ssize_t)strlen(line)) {
+				close(fd);
+				unlink(tmp);
+				return;
+			}
+		}
+	}
+	if (fchown(fd, pw->pw_uid, pw->pw_gid) < 0) {
 		close(fd);
 		unlink(tmp);
 		return;
