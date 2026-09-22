@@ -64,6 +64,7 @@
 #include <winpr/ntlm.h>
 #include <winpr/string.h>
 #include <winpr/synch.h>
+#include <winpr/wlog.h>
 
 #ifndef WESTON_BINARY
 #define WESTON_BINARY "/usr/local/bin/weston"
@@ -1434,6 +1435,17 @@ main(int argc, char *argv[])
 		setenv("HOME", pw && pw->pw_dir ? pw->pw_dir : "/root", 1);
 	}
 	winpr_InitializeSSL(WINPR_SSL_INIT_DEFAULT);
+
+	/*
+	 * FreeRDP reports the normal end of the first connection after the
+	 * redirection (ERRINFO_LOGOFF_BY_USER, BIO_read retries exceeded) as
+	 * errors. The broker logs what matters itself; show FreeRDP's peer and
+	 * transport messages only with --verbose (or an explicit WLOG_FILTER).
+	 */
+	if (!cfg.verbose && !getenv("WLOG_FILTER"))
+		WLog_AddStringLogFilters("com.freerdp.core.peer:FATAL,"
+					 "com.freerdp.core.transport:FATAL,"
+					 "com.winpr.path.shell:ERROR");
 
 	if (!ensure_certificate())
 		return 1;

@@ -59,6 +59,7 @@ RUNTIME=(
 	ghostscript             # PDF -> XPS (xpswrite) fuer mstsc-Drucker
 	openssl                 # TLS-Zertifikat des Session-Brokers
 	dbus-user-session       # dbus-run-session fuer die Sessions (Broker)
+	adwaita-icon-theme      # Maus-Cursor und Symbole fuer die Anwendungen
 )
 
 strip_comments() {

@@ -10,24 +10,30 @@ einer Anwendung erscheint beim Client als eigenes lokales Fenster.
 
 ## Stand
 
+Getestet mit Windows `mstsc` gegen einen Debian-13-LXC-Container auf Proxmox.
+
 | Bereich | Status |
 |---|---|
-| Kompiliert unter Debian 13 (FreeRDP 3) | ja |
-| Weston startet mit RDP-Backend + rdprail-shell | ja |
-| TLS mit automatisch erzeugtem Zertifikat | ja |
-| RemoteApp mit `mstsc` (Fenster, Tastatur inkl. Umlaute, Maus) | ja, getestet mit Firefox und weston-terminal |
-| Mehrere Instanzen über eine Verbindung | ja (mstsc nutzt die offene Verbindung) |
-| Abmelden, wenn die letzte App geschlossen wird | ja, nach 5 s |
-| Neue Verbindung übernimmt die laufende Session | ja |
-| Laufwerksumleitung (Client-Laufwerke im Server) | ja, über FUSE (siehe unten) |
-| Druckerumleitung | ja, eine CUPS-Warteschlange je Client-Drucker (siehe unten) |
-| RemoteApp mit `xfreerdp3` (Linux-Client) | startet, Fensterinhalt bleibt schwarz (Client-Problem) |
-| Mikrofon-Weiterleitung (audin) | unter FreeRDP 3 deaktiviert |
+| RemoteApp mit `mstsc`: Fenster, Maus, Tastatur inkl. Umlaute | ja (Firefox, gedit, weston-terminal) |
+| Mehrere Instanzen einer Anwendung | ja |
+| Session pro User, parallel mehrere User | ja, `weston-rail-broker` |
+| Anmeldung mit Passwortabfrage in mstsc (NLA) | ja, NTLM über NT-Hash-Datei |
+| Active Directory (Kerberos) | eingebaut, noch nicht getestet |
+| Allowlist veröffentlichter Programme | ja, `/etc/weston-rail/apps.conf` |
+| Laufwerke des Clients | ja: lesen, speichern, umbenennen, löschen (FUSE) |
+| Drucken auf Client-Druckern | ja, über den Windows-Treiber des Clients (XPS) |
+| Session endet nach der letzten App / Wiederverbinden | ja |
+| Ton-Ausgabe | **fehlt** (die WSLg-PulseAudio-Senke gibt es unter Debian nicht) |
+| Mikrofon (audin) | fehlt (unter FreeRDP 3 noch nicht portiert) |
+| Passwortwechsel → NT-Hash automatisch nachziehen | fehlt (siehe NLA) |
+| Linux-Client `xfreerdp3` | startet, Fensterinhalt bleibt schwarz (Client-Problem) |
 | App-Liste an den Client publizieren (`rdpapplist`) | nicht verfügbar (Microsoft-eigener Kanal) |
-| Allowlist für startbare Programme | ja (`/etc/weston-rail/apps.conf`) |
-| Session pro User mit PAM-Login | ja, `weston-rail-broker` (siehe unten) |
-| NLA (Passwortabfrage in mstsc) | ja: NTLM über NT-Hash-Datei; Kerberos/AD vorbereitet, ungetestet |
-| Session pro User | geplant (siehe Roadmap) |
+
+### Voraussetzungen im Proxmox-LXC
+
+Unter Optionen → Features **nesting** (für systemd-logind: Login-Sessions,
+`/run/user/<uid>`) und **FUSE** (Laufwerksumleitung) aktivieren, danach den
+Container neu starten.
 
 ## Schnellstart
 
@@ -38,7 +44,14 @@ cd weston-mirror
 ./scripts/install-deps.sh      # Abhängigkeiten installieren
 ./build.sh                     # konfigurieren + bauen
 ./build.sh install             # nach /usr/local installieren (sudo)
+
+sudo nano /etc/weston-rail/apps.conf          # veröffentlichte Programme
+sudo weston-rail-passwd $USER                 # NLA-Anmeldung einrichten
+sudo systemctl daemon-reload
+sudo systemctl enable --now weston-rail-broker
 ```
+
+Danach mit der `.rdp`-Datei aus dem Abschnitt Session-Broker verbinden.
 
 ### install-deps.sh
 
@@ -80,140 +93,6 @@ Nach dem ersten Lauf geht auch direkt `ninja -C build`.
 
 Gebaut wird nur, was ein headless RemoteApp-Server braucht: RDP-Backend,
 rdprail-shell, pixman-Renderer (kein GL, keine GPU nötig) und Xwayland.
-
-## Starten (manueller Test)
-
-```bash
-export XDG_RUNTIME_DIR=/run/user/$(id -u)
-weston --backend=rdp-backend.so --shell=rdprail-shell.so --port=3389 \
-       --logger-scopes=log,rdp-backend,rdprail-shell
-```
-
-`XDG_RUNTIME_DIR` muss auf ein existierendes Verzeichnis zeigen. Fehlt
-`/run/user/<uid>` (z. B. im LXC-Container ohne Login-Session):
-`sudo loginctl enable-linger $USER` oder das Verzeichnis von Hand anlegen
-(Besitzer = User, Rechte 700).
-
-Eine UTF-8-Locale setzen (`export LANG=de_DE.UTF-8` bzw. `C.UTF-8`), sonst
-zeigen Terminal-Anwendungen keine Umlaute an. Grafische Anwendungen wie
-Firefox sind davon nicht betroffen.
-
-Ohne `--rdp-tls-cert`/`--rdp-tls-key` erzeugt Weston beim Start ein
-selbstsigniertes Zertifikat. Mehr Debug-Ausgaben: `WESTON_RDP_DEBUG_LEVEL=4`.
-
-Client (Linux):
-
-```bash
-xfreerdp3 /v:SERVER:3389 /app:program:'||terminal' /cert:ignore
-```
-
-Client (Windows, empfohlen): `.rdp`-Datei mit
-
-```
-full address:s:SERVER:3389
-remoteapplicationmode:i:1
-remoteapplicationprogram:s:||firefox
-remoteapplicationname:s:Firefox
-enablecredsspsupport:i:0
-authentication level:i:0
-prompt for credentials:i:0
-```
-
-`enablecredsspsupport:i:0` ist nötig, weil der Server (noch) kein NLA kann.
-
-Für Laufwerke und Drucker zusätzlich:
-
-```
-drivestoredirect:s:*
-redirectprinters:i:1
-```
-
-## Laufwerksumleitung
-
-Die freigegebenen Laufwerke des Clients erscheinen in der Session unter
-`~/RDP-Laufwerke/<Laufwerk>` (z. B. `~/RDP-Laufwerke/C`), anderer Ort über
-`WESTON_RDP_DRIVES_DIR`, abschalten mit `WESTON_RDP_DISABLE_DRIVES=1`.
-Anwendungen öffnen und speichern dort ganz normal.
-
-Voraussetzungen: Paket `fuse3` und Zugriff auf `/dev/fuse`. Im Proxmox-LXC:
-Optionen → Features → **FUSE** aktivieren.
-
-Einschränkungen: Dateien über 4 GB, Kürzen auf eine andere Größe als 0,
-Zeitstempel und Rechte setzen werden nicht unterstützt (letzteres wird
-stillschweigend akzeptiert, damit `cp -p` & Co. funktionieren).
-
-Der rdpdr-Server stammt aus FreeRDP 3.15 und liegt korrigiert unter
-`libweston/backend-rdp/rdpdr/` (fünf Fehler behoben, die Laufwerke in
-FreeRDP unbenutzbar machen; Details im Dateikopf).
-
-## Sicherheit – bitte lesen
-
-Aktuell **nicht** im offenen Netz betreiben:
-
-- Beim **direkten Start** von Weston gibt es keine Authentifizierung: Wer den
-  Port erreicht, bekommt eine Session des startenden Users. Im Betrieb daher
-  den **Session-Broker** verwenden (PAM-Login, eine Session pro User).
-- NLA wird noch nicht unterstützt; Zugangsdaten gehen TLS-verschlüsselt im
-  Client-Info-PDU über die Leitung.
-- Startbar sind nur Programme aus der Allowlist. Ein Terminal gehört nicht
-  hinein, sonst hat jeder Client eine Shell.
-
-## Allowlist: veröffentlichte Programme
-
-Ein Client kann nur Programme starten, die in `/etc/weston-rail/apps.conf`
-stehen (`./build.sh install` legt beim ersten Mal eine Beispieldatei an).
-Die Datei wird bei jedem Start neu gelesen, Änderungen gelten sofort.
-
-```ini
-[app]
-name=firefox
-command=/usr/bin/firefox
-client-arguments=false
-
-[app]
-name=writer
-command=/usr/bin/libreoffice --writer
-client-arguments=true
-```
-
-In der `.rdp`-Datei wird das Programm über seinen Namen angefordert, wie bei
-Windows-RemoteApps: `remoteapplicationprogram:s:||firefox`. Der Pfad aus
-`command` (`/usr/bin/firefox`) wird ebenfalls akzeptiert. `command` wird ohne
-Shell ausgeführt; Argumente mit Leerzeichen in Anführungszeichen setzen.
-Argumente aus der `.rdp`-Datei (`remoteapplicationcmdline:s:…`) werden nur
-mit `client-arguments=true` angehängt, sonst ignoriert.
-
-Alles andere lehnt der Server ab (mstsc zeigt dann, dass das Programm nicht
-in der Liste der zulässigen Programme steht). Nur zum Testen lässt sich die
-Prüfung mit `WESTON_RAIL_ALLOW_ANY_PROGRAM=1` abschalten – dann kann jeder
-Client z. B. eine Shell starten. Andere Datei: `WESTON_RAIL_APPS_CONF=/pfad`.
-
-## Druckerumleitung
-
-Für jeden Drucker, den der Client meldet (`redirectprinters:i:1`), legt die
-Session eine CUPS-Warteschlange an: `rdp-<user>-<Druckername>`, Beschreibung
-„<Druckername> (<Client>)“. Sie erscheint in jedem Druckdialog (GTK, Firefox,
-LibreOffice, `lp`). Der Standarddrucker des Clients wird Standard des Users.
-Beim Trennen werden die Warteschlangen wieder entfernt.
-
-Druckweg: Anwendung → CUPS (PDF) → Filter `rdpxps` (Ghostscript `xpswrite`)
-→ Backend `rdpprint` → Session → rdpdr → Client. Drucker, die mstsc mit
-`XPSFORMAT` meldet, bekommen XPS und werden vom Windows-Treiber des Clients
-gedruckt – unabhängig vom Druckermodell. Andere Drucker bekommen generisches
-PostScript. Erzwingen mit `WESTON_RDP_PRINT_FORMAT=xps` bzw. `ps`,
-abschalten mit `WESTON_RDP_DISABLE_PRINTERS=1`.
-
-Einmalig einrichten:
-
-```bash
-sudo usermod -aG lpadmin $USER     # darf Warteschlangen anlegen; danach neu anmelden
-sudo systemctl restart cups        # nach ./build.sh install (neuer MIME-Typ)
-```
-
-`./build.sh install` legt das Backend nach `/usr/lib/cups/backend/rdpprint`
-(root, 0700 – es muss in das private Laufzeitverzeichnis des Users) und den
-Filter nach `/usr/lib/cups/filter/rdpxps`. Das Backend liefert nur an einen
-Socket in `/run/user/<uid>` des Auftrags-Users, der diesem User gehört.
 
 ## Session-Broker: eine Session pro User
 
@@ -347,9 +226,155 @@ Optionen: `weston-rail-broker --help` (Port, Zertifikat, Weston-Pfad,
 Leerlaufzeit). Für Tests ohne Broker funktioniert der direkte Start von
 Weston wie oben weiterhin.
 
+## Allowlist: veröffentlichte Programme
+
+Ein Client kann nur Programme starten, die in `/etc/weston-rail/apps.conf`
+stehen (`./build.sh install` legt beim ersten Mal eine Beispieldatei an).
+Die Datei wird bei jedem Start neu gelesen, Änderungen gelten sofort.
+
+```ini
+[app]
+name=firefox
+command=/usr/bin/firefox
+client-arguments=false
+
+[app]
+name=writer
+command=/usr/bin/libreoffice --writer
+client-arguments=true
+```
+
+In der `.rdp`-Datei wird das Programm über seinen Namen angefordert, wie bei
+Windows-RemoteApps: `remoteapplicationprogram:s:||firefox`. Der Pfad aus
+`command` (`/usr/bin/firefox`) wird ebenfalls akzeptiert. `command` wird ohne
+Shell ausgeführt; Argumente mit Leerzeichen in Anführungszeichen setzen.
+Argumente aus der `.rdp`-Datei (`remoteapplicationcmdline:s:…`) werden nur
+mit `client-arguments=true` angehängt, sonst ignoriert.
+
+Alles andere lehnt der Server ab (mstsc zeigt dann, dass das Programm nicht
+in der Liste der zulässigen Programme steht). Nur zum Testen lässt sich die
+Prüfung mit `WESTON_RAIL_ALLOW_ANY_PROGRAM=1` abschalten – dann kann jeder
+Client z. B. eine Shell starten. Andere Datei: `WESTON_RAIL_APPS_CONF=/pfad`.
+
+## Laufwerksumleitung
+
+Die freigegebenen Laufwerke des Clients erscheinen in der Session unter
+`~/RDP-Laufwerke/<Laufwerk>` (z. B. `~/RDP-Laufwerke/C`), anderer Ort über
+`WESTON_RDP_DRIVES_DIR`, abschalten mit `WESTON_RDP_DISABLE_DRIVES=1`.
+Anwendungen öffnen und speichern dort ganz normal.
+
+Voraussetzungen: Paket `fuse3` und Zugriff auf `/dev/fuse`. Im Proxmox-LXC:
+Optionen → Features → **FUSE** aktivieren.
+
+Einschränkungen: Dateien über 4 GB, Kürzen auf eine andere Größe als 0,
+Zeitstempel und Rechte setzen werden nicht unterstützt (letzteres wird
+stillschweigend akzeptiert, damit `cp -p` & Co. funktionieren).
+
+Der rdpdr-Server stammt aus FreeRDP 3.15 und liegt korrigiert unter
+`libweston/backend-rdp/rdpdr/` (fünf Fehler behoben, die Laufwerke in
+FreeRDP unbenutzbar machen; Details im Dateikopf).
+
+## Druckerumleitung
+
+Für jeden Drucker, den der Client meldet (`redirectprinters:i:1`), legt die
+Session eine CUPS-Warteschlange an: `rdp-<user>-<Druckername>`, Beschreibung
+„<Druckername> (<Client>)“. Sie erscheint in jedem Druckdialog (GTK, Firefox,
+LibreOffice, `lp`). Der Standarddrucker des Clients wird Standard des Users.
+Beim Trennen werden die Warteschlangen wieder entfernt.
+
+Druckweg: Anwendung → CUPS (PDF) → Filter `rdpxps` (Ghostscript `xpswrite`)
+→ Backend `rdpprint` → Session → rdpdr → Client. Drucker, die mstsc mit
+`XPSFORMAT` meldet, bekommen XPS und werden vom Windows-Treiber des Clients
+gedruckt – unabhängig vom Druckermodell. Andere Drucker bekommen generisches
+PostScript. Erzwingen mit `WESTON_RDP_PRINT_FORMAT=xps` bzw. `ps`,
+abschalten mit `WESTON_RDP_DISABLE_PRINTERS=1`.
+
+Einmalig einrichten:
+
+```bash
+sudo usermod -aG lpadmin $USER     # darf Warteschlangen anlegen; danach neu anmelden
+sudo systemctl restart cups        # nach ./build.sh install (neuer MIME-Typ)
+```
+
+`./build.sh install` legt das Backend nach `/usr/lib/cups/backend/rdpprint`
+(root, 0700 – es muss in das private Laufzeitverzeichnis des Users) und den
+Filter nach `/usr/lib/cups/filter/rdpxps`. Das Backend liefert nur an einen
+Socket in `/run/user/<uid>` des Auftrags-Users, der diesem User gehört.
+
+## Sicherheit – bitte lesen
+
+Der Stand ist jung; vor einem Einsatz im offenen Netz noch einmal prüfen.
+
+- Betrieb nur über den **Session-Broker**. Beim direkten Start von Weston
+  gibt es keine Anmeldung: Wer den Port erreicht, bekommt eine Session des
+  startenden Users.
+- Mit NLA (`--nla-only`) prüft der Server die Anmeldung, bevor eine Session
+  entsteht. Ohne NLA gehen die Zugangsdaten TLS-verschlüsselt im
+  Client-Info-PDU über die Leitung.
+- Mit dem selbstsignierten Zertifikat und `authentication level:i:0` prüft
+  mstsc die Identität des Servers nicht. Für den Betrieb ein
+  vertrauenswürdiges Zertifikat und `authentication level:i:2` verwenden.
+- `/etc/weston-rail/ntlm.sam` enthält NT-Hashes (so schützenswert wie
+  Passwörter, nur root lesbar).
+- Startbar sind nur Programme aus der Allowlist. Ein Terminal gehört nicht
+  hinein, sonst hat jeder Client eine Shell.
+
+## Ohne Broker: Weston direkt starten (Test)
+
+```bash
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+weston --backend=rdp-backend.so --shell=rdprail-shell.so --port=3389 \
+       --logger-scopes=log,rdp-backend,rdprail-shell
+```
+
+`XDG_RUNTIME_DIR` muss auf ein existierendes Verzeichnis zeigen. Fehlt
+`/run/user/<uid>` (z. B. im LXC-Container ohne Login-Session):
+`sudo loginctl enable-linger $USER` oder das Verzeichnis von Hand anlegen
+(Besitzer = User, Rechte 700).
+
+Eine UTF-8-Locale setzen (`export LANG=de_DE.UTF-8` bzw. `C.UTF-8`), sonst
+zeigen Terminal-Anwendungen keine Umlaute an. Grafische Anwendungen wie
+Firefox sind davon nicht betroffen.
+
+Ohne `--rdp-tls-cert`/`--rdp-tls-key` erzeugt Weston beim Start ein
+selbstsigniertes Zertifikat. Mehr Debug-Ausgaben: `WESTON_RDP_DEBUG_LEVEL=4`.
+
+Client (Linux):
+
+```bash
+xfreerdp3 /v:SERVER:3389 /app:program:'||terminal' /cert:ignore
+```
+
+Client (Windows, empfohlen): `.rdp`-Datei mit
+
+```
+full address:s:SERVER:3389
+remoteapplicationmode:i:1
+remoteapplicationprogram:s:||firefox
+remoteapplicationname:s:Firefox
+enablecredsspsupport:i:0
+authentication level:i:0
+prompt for credentials:i:0
+```
+
+`enablecredsspsupport:i:0` ist nötig, weil der Server (noch) kein NLA kann.
+
+Für Laufwerke und Drucker zusätzlich:
+
+```
+drivestoredirect:s:*
+redirectprinters:i:1
+```
+
 ## Änderungen gegenüber microsoft/weston-mirror
 
-- Port auf die FreeRDP-3-API (Zertifikate, RFX, Clipboard, WinPR-Stringfunktionen)
-- audin unter FreeRDP 3 als Stub
-- Xwayland wird mit `-listenfd` statt dem veralteten `-listen` gestartet
+- Port auf die FreeRDP-3-API (Zertifikate, RFX, Clipboard, Tastatur, WinPR),
+  Laufzeitfehler mit FreeRDP 3 behoben (drdynvc, Aktivierung, Fenster-Orders)
+- RAIL: mehrere Instanzen, Abmelden nach der letzten App, Übernahme der
+  Session durch eine neue Verbindung, Allowlist, Programmstart mit Argumenten
+- Geräteumleitung (rdpdr): Laufwerke per FUSE, Drucker per CUPS (XPS);
+  korrigierte Kopie des FreeRDP-rdpdr-Servers unter `libweston/backend-rdp/rdpdr/`
+- Session-Broker `weston-rail-broker` (PAM, NLA, Umleitung, eine Weston-Instanz
+  pro User) und `weston-rail-passwd`
+- audin unter FreeRDP 3 als Stub, Xwayland mit `-listenfd`
 - Build- und Installationsskripte
