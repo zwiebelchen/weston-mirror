@@ -271,7 +271,7 @@ Wichtig:
   (die mobilen Apps können ein unbekanntes Zertifikat akzeptieren). Ein
   eigenes Zertifikat, z. B. Let's Encrypt, per
   `sudo systemctl edit weston-rail-feed` →
-  `Environment=FEED_ARGS=--cert=/pfad/fullchain.pem --key=/pfad/privkey.pem`.
+  `Environment="FEED_ARGS=--cert=/pfad/fullchain.pem --key=/pfad/privkey.pem`."
 - **Hinter einem Reverse Proxy** (Caddy, nginx) mit Let's-Encrypt-Zertifikat
   spricht der Feed nur HTTP auf localhost, TLS macht der Proxy (siehe
   „Feed hinter Caddy“).
@@ -293,7 +293,7 @@ Port 443 und holt das Zertifikat:
 ```bash
 sudo systemctl edit weston-rail-feed
 #   [Service]
-#   Environment=FEED_ARGS=--http --listen=127.0.0.1 --port=8080
+#   Environment="FEED_ARGS=--http --listen=127.0.0.1 --port=8080"
 sudo systemctl restart weston-rail-feed
 ```
 
@@ -319,10 +319,12 @@ greifen also von selbst:
 D=/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/desktop.example.org
 sudo systemctl edit weston-rail-broker
 #   [Service]
-#   Environment=BROKER_ARGS=--cert=$D/desktop.example.org.crt --key=$D/desktop.example.org.key
+#   Environment="BROKER_ARGS=--cert=$D/desktop.example.org.crt --key=$D/desktop.example.org.key"
 ```
 
-(`$D` in der Unit ausgeschrieben eintragen.)
+(`$D` in der Unit ausgeschrieben eintragen. Enthält die Zeile Leerzeichen,
+die ganze Zuweisung in Anführungszeichen setzen: `Environment="…"`, sonst
+ignoriert systemd alles nach dem ersten Leerzeichen.)
 
 ## Allowlist: veröffentlichte Programme
 
