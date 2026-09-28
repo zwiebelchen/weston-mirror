@@ -15,6 +15,7 @@ Getestet mit Windows `mstsc` gegen einen Debian-13-LXC-Container auf Proxmox.
 | Bereich | Status |
 |---|---|
 | RemoteApp mit `mstsc`: Fenster, Maus, Tastatur inkl. Umlaute | ja (Firefox, gedit, weston-terminal) |
+| X11-Programme (Java/Swing, ältere Toolkits) | ja, die Sessions starten mit Xwayland |
 | Mehrere Instanzen einer Anwendung | ja |
 | Session pro User, parallel mehrere User | ja, `weston-rail-broker` |
 | Anmeldung mit Passwortabfrage in mstsc (NLA) | ja, NTLM über NT-Hash-Datei |
@@ -134,6 +135,33 @@ disableconnectionsharing:i:1
 drivestoredirect:s:*
 redirectprinters:i:1
 ```
+
+### Fehlersuche bei Anwendungen
+
+Alles, was ein Programm auf stdout/stderr schreibt, steht im Log seiner
+Session, zusammen mit den Meldungen von Weston:
+
+```bash
+sudo tail -f /run/user/$(id -u BENUTZER)/weston-rail.log
+```
+
+Dort steht auch, was gestartet wurde:
+`RDP RAIL: 'firefox' allowed, starting: /usr/bin/firefox`.
+
+Startet ein Programm gar nicht, hilft ein Wrapper-Skript als `command`, das
+Umgebung setzt und die Ausgabe zusätzlich wegschreibt:
+
+```sh
+#!/bin/sh
+exec >>"$HOME/meine-app.log" 2>&1
+echo "--- Start $(date), DISPLAY=$DISPLAY WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+exec /pfad/zur/anwendung "$@"
+```
+
+X11-Programme (Java/Swing, Motif, ältere Toolkits) brauchen Xwayland; der
+Broker startet die Sessions damit (abschaltbar mit `--no-xwayland`). Ohne
+Xwayland fehlt `DISPLAY`, und solche Programme beenden sich sofort und
+kommentarlos. Paket `xwayland` muss installiert sein.
 
 ### Sessions verwalten
 

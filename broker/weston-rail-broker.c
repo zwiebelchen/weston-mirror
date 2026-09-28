@@ -88,6 +88,7 @@ static struct {
 	char *weston;
 	int idle_exit_sec;
 	bool allow_root;
+	bool xwayland;
 	bool verbose;
 	char *names[16];	/* --name: extra DNS names for the certificate */
 	int n_names;
@@ -106,6 +107,7 @@ static struct {
 	.keytab = "/etc/weston-rail/krb5.keytab",
 	.nla = true,
 	.tls_login = true,
+	.xwayland = true,
 };
 
 enum { USER_MAP_PLAIN, USER_MAP_UPN, USER_MAP_NETBIOS };
@@ -547,6 +549,10 @@ session_keeper(const struct passwd *pw, const char *ctl)
 		argv[argc++] = "--backend=rdp-backend.so";
 		argv[argc++] = "--shell=rdprail-shell.so";
 		argv[argc++] = "--logger-scopes=log,rdp-backend,rdprail-shell";
+		/* X11 only programs (Java/Swing, older toolkits) need Xwayland;
+		 * weston then exports DISPLAY to the programs it starts */
+		if (cfg.xwayland)
+			argv[argc++] = "--xwayland";
 		argv[argc++] = log_opt;
 		if (access(certpath, R_OK) == 0 && access(keypath, R_OK) == 0) {
 			argv[argc++] = cert_opt;
@@ -1560,6 +1566,8 @@ usage(void)
 		"                         upn (lars@realm) or netbios (DOMAIN\\lars)\n"
 		"      --no-nla           do not offer NLA\n"
 		"      --nla-only         refuse logins without NLA\n"
+		"      --no-xwayland      start the sessions without Xwayland (X11 programs\n"
+		"                         such as Java/Swing then do not work)\n"
 		"      --allow-root       allow sessions for root\n"
 		"  -v, --verbose\n", WESTON_BINARY);
 }
@@ -1574,6 +1582,7 @@ main(int argc, char *argv[])
 		{ "weston", required_argument, NULL, 'w' },
 		{ "idle-exit", required_argument, NULL, 'i' },
 		{ "allow-root", no_argument, NULL, 'R' },
+		{ "no-xwayland", no_argument, NULL, 'X' },
 		{ "name", required_argument, NULL, 'n' },
 		{ "sam", required_argument, NULL, 'S' },
 		{ "keytab", required_argument, NULL, 'K' },
@@ -1597,6 +1606,7 @@ main(int argc, char *argv[])
 		case 'w': cfg.weston = optarg; break;
 		case 'i': cfg.idle_exit_sec = atoi(optarg); break;
 		case 'R': cfg.allow_root = true; break;
+		case 'X': cfg.xwayland = false; break;
 		case 'S': cfg.sam = optarg; break;
 		case 'K': cfg.keytab = optarg; break;
 		case 'M':
