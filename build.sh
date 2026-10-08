@@ -41,10 +41,12 @@ MESON_OPTS=(
 	-Dbackend-fbdev=false
 	-Drenderer-gl=false
 	-Dshell-rdprail=true
-	-Dshell-desktop=false
+	# fuer Browser-Sitzungen (weston-rail-web): eine Anwendung bildschirm-
+	# fuellend (kiosk) oder mit Fensterverwaltung (desktop)
+	-Dshell-kiosk=true
+	-Dshell-desktop=true
 	-Dshell-fullscreen=false
 	-Dshell-ivi=false
-	-Dshell-kiosk=false
 	-Dlauncher-logind=false
 	-Dxwayland=true
 	-Dremoting=false

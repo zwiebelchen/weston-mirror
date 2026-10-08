@@ -127,9 +127,14 @@ struct login {
 	char nthash[33];
 };
 
+/* RAIL sessions serve mstsc (RemoteApp), web sessions serve the browser
+ * (weston-rail-web): one program, kiosk or desktop shell, ordinary RDP. */
+enum session_kind { SESSION_RAIL, SESSION_WEB };
+
 struct session {
 	struct session *next;
 	char user[64];
+	enum session_kind kind;
 	uid_t uid;
 	pid_t pid;		/* session keeper process */
 	char ctl[108];		/* weston control socket */
@@ -376,6 +381,118 @@ copy_file_for_user(const char *src, const char *dst, uid_t uid, gid_t gid)
 	return ok;
 }
 
+
+/*
+ * The program a web session starts, from the same allowlist the RAIL
+ * sessions use (/etc/weston-rail/apps.conf, [app] name/command).
+ */
+static bool
+lookup_app(const char *name, char *command, size_t size)
+{
+	const char *conf = getenv("WESTON_RAIL_APPS_CONF");
+	char line[4096], cur_name[128] = "", cur_cmd[2048] = "";
+	bool in_app = false, found = false;
+	FILE *f;
+
+	if (!conf || !*conf)
+		conf = "/etc/weston-rail/apps.conf";
+	f = fopen(conf, "re");
+	if (!f)
+		return false;
+	while (!found && fgets(line, sizeof line, f)) {
+		char *l = line, *eq, *end;
+
+		while (*l == ' ' || *l == '\t')
+			l++;
+		end = l + strlen(l);
+		while (end > l && strchr(" \t\r\n", end[-1]))
+			*--end = '\0';
+		if (!*l || *l == '#' || *l == ';')
+			continue;
+		if (*l == '[') {
+			if (in_app && !strcasecmp(cur_name, name) && cur_cmd[0]) {
+				found = true;
+				break;
+			}
+			in_app = !strcmp(l, "[app]");
+			cur_name[0] = cur_cmd[0] = '\0';
+			continue;
+		}
+		eq = strchr(l, '=');
+		if (!eq || !in_app)
+			continue;
+		*eq++ = '\0';
+		end = l + strlen(l);
+		while (end > l && (end[-1] == ' ' || end[-1] == '\t'))
+			*--end = '\0';
+		while (*eq == ' ' || *eq == '\t')
+			eq++;
+		if (!strcmp(l, "name"))
+			snprintf(cur_name, sizeof cur_name, "%s", eq);
+		else if (!strcmp(l, "command"))
+			snprintf(cur_cmd, sizeof cur_cmd, "%s", eq);
+	}
+	if (!found && in_app && !strcasecmp(cur_name, name) && cur_cmd[0])
+		found = true;
+	fclose(f);
+	if (found)
+		snprintf(command, size, "%s", cur_cmd);
+	return found;
+}
+
+/* split a command line like the shell would, without a shell */
+static char **
+split_command(const char *cmd)
+{
+	size_t len = strlen(cmd);
+	char **argv = calloc(len / 2 + 2, sizeof *argv);
+	char *buf = malloc(len + 1), *out;
+	int argc = 0;
+	char quote = 0;
+	bool in_arg = false;
+
+	if (!argv || !buf) {
+		free(argv);
+		free(buf);
+		return NULL;
+	}
+	out = buf;
+	for (const char *p = cmd; *p; p++) {
+		char c = *p;
+
+		if (quote) {
+			if (c == quote)
+				quote = 0;
+			else
+				*out++ = c;
+			continue;
+		}
+		if (c == ' ' || c == '\t') {
+			if (in_arg) {
+				*out++ = '\0';
+				in_arg = false;
+			}
+			continue;
+		}
+		if (!in_arg) {
+			argv[argc++] = out;
+			in_arg = true;
+		}
+		if (c == '\'' || c == '"')
+			quote = c;
+		else
+			*out++ = c;
+	}
+	*out = '\0';
+	if (argc == 0) {
+		free(buf);
+		free(argv);
+		return NULL;
+	}
+	argv[argc] = NULL;
+	return argv;
+}
+
 struct pam_open_job {
 	pam_handle_t *pamh;
 	pthread_mutex_t lock;
@@ -413,7 +530,8 @@ keeper_sigterm(int sig)
 
 /* runs in the session keeper process (root), never returns */
 static void
-session_keeper(const struct passwd *pw, const char *ctl)
+session_keeper(const struct passwd *pw, const char *ctl, enum session_kind kind,
+	       const char *app_command, const char *shell)
 {
 	struct pam_creds creds = { pw->pw_name, NULL };
 	struct pam_conv conv = { pam_conv_cb, &creds };
@@ -486,7 +604,8 @@ session_keeper(const struct passwd *pw, const char *ctl)
 	if (!copy_file_for_user(cfg.cert, certpath, pw->pw_uid, pw->pw_gid) ||
 	    !copy_file_for_user(cfg.key, keypath, pw->pw_uid, pw->pw_gid))
 		logmsg("session for %s: cannot provide the TLS certificate", pw->pw_name);
-	snprintf(logpath, sizeof logpath, "%s/weston-rail.log", rundir);
+	snprintf(logpath, sizeof logpath, "%s/weston-rail%s.log", rundir,
+		 kind == SESSION_WEB ? "-web" : "");
 	read_default_lang(lang, sizeof lang);
 
 	signal(SIGTERM, keeper_sigterm);
@@ -538,6 +657,13 @@ session_keeper(const struct passwd *pw, const char *ctl)
 		if (fd >= 0)
 			dup2(fd, STDIN_FILENO);
 
+		if (kind == SESSION_WEB) {
+			/* one program, no RemoteApp: ordinary RDP, which every
+			 * client understands (e.g. guacd for the browser) */
+			setenv("WESTON_RDP_WEB_SESSION", "1", 1);
+			if (app_command && *app_command)
+				setenv("WESTON_AUTOLAUNCH", app_command, 1);
+		}
 		snprintf(cert_opt, sizeof cert_opt, "--rdp-tls-cert=%s", certpath);
 		snprintf(key_opt, sizeof key_opt, "--rdp-tls-key=%s", keypath);
 		snprintf(log_opt, sizeof log_opt, "--log=%s", logpath);
@@ -547,7 +673,13 @@ session_keeper(const struct passwd *pw, const char *ctl)
 		}
 		argv[argc++] = cfg.weston;
 		argv[argc++] = "--backend=rdp-backend.so";
-		argv[argc++] = "--shell=rdprail-shell.so";
+		if (kind == SESSION_WEB) {
+			argv[argc++] = shell && !strcmp(shell, "desktop") ?
+				"--shell=desktop-shell.so" : "--shell=kiosk-shell.so";
+			argv[argc++] = "--socket=weston-rail-web";
+		} else {
+			argv[argc++] = "--shell=rdprail-shell.so";
+		}
 		argv[argc++] = "--logger-scopes=log,rdp-backend,rdprail-shell";
 		/* X11 only programs (Java/Swing, older toolkits) need Xwayland;
 		 * weston then exports DISPLAY to the programs it starts */
@@ -573,10 +705,10 @@ session_keeper(const struct passwd *pw, const char *ctl)
 	}
 	unlink(ctl);
 	{
-		char sam[128];
+		char path[160];
 
-		snprintf(sam, sizeof sam, "%s/weston-rail-ntlm.sam", rundir);
-		unlink(sam);
+		snprintf(path, sizeof path, "%s/weston-rail-ntlm.sam", rundir);
+		unlink(path);
 	}
 	unlink(certpath);
 	unlink(keypath);
@@ -595,19 +727,20 @@ session_keeper(const struct passwd *pw, const char *ctl)
 }
 
 static struct session *
-session_find_locked(const char *user)
+session_find_locked(const char *user, enum session_kind kind)
 {
 	struct session *s;
 
 	for (s = sessions; s; s = s->next)
-		if (!strcmp(s->user, user))
+		if (!strcmp(s->user, user) && s->kind == kind)
 			return s;
 	return NULL;
 }
 
 /* returns the control socket path of the user's (possibly new) weston */
 static bool
-session_get(const char *user, char ctl[108])
+session_get_kind(const char *user, enum session_kind kind, const char *app_command,
+		 const char *shell, char ctl[108])
 {
 	struct passwd pwbuf, *pw = NULL;
 	char buf[4096];
@@ -615,7 +748,7 @@ session_get(const char *user, char ctl[108])
 	pid_t pid;
 
 	pthread_mutex_lock(&lock);
-	s = session_find_locked(user);
+	s = session_find_locked(user, kind);
 	if (s) {
 		memcpy(ctl, s->ctl, 108);
 		pthread_mutex_unlock(&lock);
@@ -641,12 +774,13 @@ session_get(const char *user, char ctl[108])
 	snprintf(s->user, sizeof s->user, "%s", user);
 	s->uid = pw->pw_uid;
 	s->started = time(NULL);
-	snprintf(s->ctl, sizeof s->ctl, "/run/user/%u/weston-rail.sock",
-		 (unsigned)pw->pw_uid);
+	s->kind = kind;
+	snprintf(s->ctl, sizeof s->ctl, "/run/user/%u/weston-rail%s.sock",
+		 (unsigned)pw->pw_uid, kind == SESSION_WEB ? "-web" : "");
 
 	pid = fork();
 	if (pid == 0)
-		session_keeper(pw, s->ctl);	/* no return */
+		session_keeper(pw, s->ctl, kind, app_command, shell);	/* no return */
 	if (pid < 0) {
 		pthread_mutex_unlock(&lock);
 		free(s);
@@ -657,8 +791,15 @@ session_get(const char *user, char ctl[108])
 	sessions = s;
 	memcpy(ctl, s->ctl, 108);
 	pthread_mutex_unlock(&lock);
-	logmsg("session for %s started (uid %u)", user, (unsigned)pw->pw_uid);
+	logmsg("%ssession for %s started (uid %u)", kind == SESSION_WEB ? "web " : "",
+	       user, (unsigned)pw->pw_uid);
 	return true;
+}
+
+static bool
+session_get(const char *user, char ctl[108])
+{
+	return session_get_kind(user, SESSION_RAIL, NULL, NULL, ctl);
 }
 
 static void *
@@ -1306,7 +1447,9 @@ admin_logoff(int fd, const char *user)
 	pid_t pid = 0;
 
 	pthread_mutex_lock(&lock);
-	s = session_find_locked(user);
+	s = session_find_locked(user, SESSION_RAIL);
+	if (!s)
+		s = session_find_locked(user, SESSION_WEB);
 	if (s)
 		pid = s->pid;
 	pthread_mutex_unlock(&lock);
@@ -1334,6 +1477,9 @@ admin_logoff(int fd, const char *user)
  */
 struct oneshot {
 	char user[64];
+	char app_command[2048];
+	char shell[16];
+	enum session_kind kind;
 	int fd;
 	uid_t allow_uid;
 	bool restrict_uid;
@@ -1368,7 +1514,8 @@ oneshot_thread(void *data)
 			return NULL;
 		}
 	}
-	if (session_get(o->user, ctl) && send_fd(ctl, conn))
+	if (session_get_kind(o->user, o->kind, o->app_command, o->shell, ctl) &&
+	    send_fd(ctl, conn))
 		logmsg("direct connection of %s handed to the session", o->user);
 	else
 		logmsg("could not hand the direct connection of %s to the session", o->user);
@@ -1383,19 +1530,44 @@ admin_connect(int fd, char *args)
 	struct sockaddr_in addr = { .sin_family = AF_INET };
 	socklen_t len = sizeof addr;
 	struct oneshot *o;
-	char ctl[108];
-	char *user = args, *uid_str = strchr(args, ' ');
+	char ctl[108], command[2048] = "", shell[16] = "kiosk";
+	char *user = args, *tok, *save = NULL;
+	enum session_kind kind = SESSION_RAIL;
+	uid_t allow_uid = 0;
+	bool restrict_uid = false;
 	pthread_t tid;
 	int lfd;
 
-	if (uid_str)
-		*uid_str++ = '\0';
+	/* CONNECT <user> [uid=N] [app=NAME] [shell=kiosk|desktop] */
+	tok = strchr(args, ' ');
+	if (tok)
+		*tok++ = '\0';
 	if (!valid_username(user)) {
 		admin_reply(fd, "ERR invalid user name\n");
 		return;
 	}
+	for (tok = tok ? strtok_r(tok, " ", &save) : NULL; tok;
+	     tok = strtok_r(NULL, " ", &save)) {
+		if (!strncmp(tok, "uid=", 4)) {
+			allow_uid = (uid_t)strtoul(tok + 4, NULL, 10);
+			restrict_uid = true;
+		} else if (!strncmp(tok, "app=", 4)) {
+			if (!lookup_app(tok + 4, command, sizeof command)) {
+				admin_reply(fd, "ERR '%s' is not published\n", tok + 4);
+				return;
+			}
+			kind = SESSION_WEB;
+		} else if (!strncmp(tok, "shell=", 6)) {
+			snprintf(shell, sizeof shell, "%s", tok + 6);
+		} else if (!strchr(tok, '=')) {
+			/* old form: CONNECT <user> <uid> */
+			allow_uid = (uid_t)strtoul(tok, NULL, 10);
+			restrict_uid = true;
+		}
+	}
+
 	/* start the session now, so the client finds it right away */
-	if (!session_get(user, ctl)) {
+	if (!session_get_kind(user, kind, command, shell, ctl)) {
 		admin_reply(fd, "ERR no session for %s\n", user);
 		return;
 	}
@@ -1418,11 +1590,12 @@ admin_connect(int fd, char *args)
 		return;
 	}
 	snprintf(o->user, sizeof o->user, "%s", user);
+	snprintf(o->app_command, sizeof o->app_command, "%s", command);
+	snprintf(o->shell, sizeof o->shell, "%s", shell);
+	o->kind = kind;
 	o->fd = lfd;
-	if (uid_str && *uid_str) {
-		o->allow_uid = (uid_t)strtoul(uid_str, NULL, 10);
-		o->restrict_uid = true;
-	}
+	o->allow_uid = allow_uid;
+	o->restrict_uid = restrict_uid;
 	if (pthread_create(&tid, NULL, oneshot_thread, o) != 0) {
 		close(lfd);
 		free(o);
@@ -1430,8 +1603,8 @@ admin_connect(int fd, char *args)
 		return;
 	}
 	pthread_detach(tid);
-	logmsg("direct connection for %s: waiting on 127.0.0.1:%u", user,
-	       (unsigned)ntohs(addr.sin_port));
+	logmsg("direct connection for %s (%s): waiting on 127.0.0.1:%u", user,
+	       kind == SESSION_WEB ? "web" : "RemoteApp", (unsigned)ntohs(addr.sin_port));
 	admin_reply(fd, "PORT %u\n", (unsigned)ntohs(addr.sin_port));
 }
 

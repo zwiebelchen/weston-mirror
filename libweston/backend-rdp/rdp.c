@@ -1163,10 +1163,11 @@ xf_peer_activate_finish(freerdp_peer* client)
 
 	peerCtx->activation_pending = FALSE;
 
-	if (settings->RemoteApplicationMode ||
+	if (!getenv("WESTON_RDP_WEB_SESSION") &&
+	    (settings->RemoteApplicationMode ||
 		settings->RedirectClipboard ||
 		settings->AudioPlayback ||
-		settings->AudioCapture) {
+		settings->AudioCapture)) {
 
 		if (settings->RemoteApplicationMode)
 			if (!rdp_rail_peer_activate(client))
@@ -1373,10 +1374,11 @@ xf_peer_activate(freerdp_peer* client)
 	settings->AudioPlayback = b->audio_out_setup && b->audio_out_teardown;
 	settings->AudioCapture = b->audio_in_setup && b->audio_in_teardown;
 
-	if (settings->RemoteApplicationMode ||
+	if (!getenv("WESTON_RDP_WEB_SESSION") &&
+	    (settings->RemoteApplicationMode ||
 		settings->RedirectClipboard ||
 		settings->AudioPlayback ||
-		settings->AudioCapture) {
+		settings->AudioCapture)) {
 
 		if (!peerCtx->vcm) {
 			rdp_debug_error(b, "Virtual channel is required for RAIL, clipboard, audio playback/capture\n");
@@ -2101,7 +2103,9 @@ rdp_peer_init(freerdp_peer *client, struct rdp_backend *b)
 	settings->NSCodec = TRUE;
 	settings->FrameMarkerCommandEnabled = TRUE;
 	settings->SurfaceFrameMarkerEnabled = TRUE;
-	settings->RemoteApplicationMode = TRUE;
+	/* web sessions (weston-rail-web) run one program under kiosk-shell or
+	 * desktop-shell and speak ordinary RDP, which every client supports */
+	settings->RemoteApplicationMode = getenv("WESTON_RDP_WEB_SESSION") ? FALSE : TRUE;
 	settings->RemoteApplicationSupportLevel =
 		RAIL_LEVEL_SUPPORTED |
 		RAIL_LEVEL_SHELL_INTEGRATION_SUPPORTED |
@@ -2123,6 +2127,14 @@ rdp_peer_init(freerdp_peer *client, struct rdp_backend *b)
 	settings->SupportGraphicsPipeline = TRUE;
 	settings->SupportMonitorLayoutPdu = TRUE;
 	settings->RedirectClipboard = TRUE;
+	if (!settings->RemoteApplicationMode) {
+		/* web session: clipboard and audio would make the activation
+		 * wait for the dynamic virtual channel, which simple clients
+		 * (guacd) never bring up; plain RDP drawing needs none of it */
+		settings->RedirectClipboard = FALSE;
+		settings->AudioPlayback = FALSE;
+		settings->AudioCapture = FALSE;
+	}
 	settings->HasExtendedMouseEvent = TRUE;
 	settings->HasHorizontalWheel = TRUE;
 

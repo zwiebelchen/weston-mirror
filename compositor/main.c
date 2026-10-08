@@ -3734,6 +3734,22 @@ wet_main(int argc, char *argv[])
 	/* Until RDP connection is established, keep compositor sleep state */
 	weston_compositor_sleep(wet.compositor);
 
+	{
+		/*
+		 * weston-rail-web: start one program in this session once
+		 * everything is up. It inherits the environment, above all
+		 * WAYLAND_DISPLAY and DISPLAY (Xwayland), which a program
+		 * started from outside would not have.
+		 */
+		const char *autolaunch = getenv("WESTON_AUTOLAUNCH");
+
+		if (autolaunch && *autolaunch) {
+			weston_log("autolaunch: %s\n", autolaunch);
+			if (!weston_client_start_command(wet.compositor, autolaunch))
+				weston_log("autolaunch failed\n");
+		}
+	}
+
 	wl_display_run(display);
 
 	/* Allow for setting return exit code after
