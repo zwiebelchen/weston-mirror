@@ -25,6 +25,10 @@
 
 #include "config.h"
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <netdb.h>
@@ -545,6 +549,14 @@ session_keeper(const struct passwd *pw, const char *ctl, enum session_kind kind,
 	int rc, status = 0;
 
 	setsid();
+
+	/*
+	 * Geerbte Dateideskriptoren schliessen. Der Wächter lebt so lange wie
+	 * die Sitzung und ruft selbst kein exec auf; eine mitgeerbte offene
+	 * Verwaltungsverbindung würde den Aufrufer (weston-rail-web) warten
+	 * lassen, bis die Sitzung endet.
+	 */
+	closefrom(3);
 
 	/*
 	 * pam_systemd blocks for 25 s when systemd-logind does not answer (e.g.
