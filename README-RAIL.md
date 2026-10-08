@@ -171,6 +171,14 @@ sudo weston-rail-sessions --json          # dasselbe als JSON (für Verwaltungsp
 sudo weston-rail-sessions --logoff lars   # Session beenden (Weston und seine Programme)
 ```
 
+Übergabe ohne Umleitung für Clients, die der RDP-Umleitung nicht folgen
+(z. B. `guacd`): `CONNECT <user> [<uid>]` startet die Session und öffnet
+einen einmaligen Port auf 127.0.0.1, der in der Antwort steht (`PORT <n>`).
+Die erste Verbindung dorthin wird an die Session übergeben, danach ist der
+Port zu. Mit `<uid>` darf nur dieser lokale Benutzer verbinden. Der Aufrufer
+muss den Benutzer vorher selbst authentifiziert haben – die
+Verwaltungsschnittstelle ist root vorbehalten.
+
 Eine *getrennte* Session läuft mit ihren Programmen weiter, bis der User sich
 wieder verbindet; sie endet von selbst, sobald keine Programme mehr laufen.
 Schnittstelle: `/run/weston-rail-broker.sock` (nur root), Befehle `LIST` und

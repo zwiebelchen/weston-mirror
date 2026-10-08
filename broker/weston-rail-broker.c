@@ -1319,6 +1319,122 @@ admin_logoff(int fd, const char *user)
 	admin_reply(fd, "OK\n");
 }
 
+
+/*
+ * Hand-over without redirection, for clients that cannot follow a Server
+ * Redirection PDU (guacd/Apache Guacamole, see weston-rail-web).
+ *
+ * "CONNECT <user> [<uid>]" at the admin socket starts the user's session
+ * if needed and opens a one-time listener on 127.0.0.1. The first
+ * connection within 60 s is handed to that session, then the listener is
+ * closed. With <uid> only that local user may connect (e.g. the uid guacd
+ * runs as); without it any local process may, so the port is the secret.
+ * The caller must already have authenticated the user - the admin socket
+ * is root only.
+ */
+struct oneshot {
+	char user[64];
+	int fd;
+	uid_t allow_uid;
+	bool restrict_uid;
+};
+
+static void *
+oneshot_thread(void *data)
+{
+	struct oneshot *o = data;
+	struct pollfd pfd = { .fd = o->fd, .events = POLLIN };
+	char ctl[108];
+	int conn = -1;
+
+	if (poll(&pfd, 1, 60 * 1000) > 0)
+		conn = accept4(o->fd, NULL, NULL, SOCK_CLOEXEC);
+	close(o->fd);
+	if (conn < 0) {
+		logmsg("direct connection for %s: nobody connected", o->user);
+		free(o);
+		return NULL;
+	}
+	if (o->restrict_uid) {
+		struct ucred cred;
+		socklen_t cl = sizeof cred;
+
+		if (getsockopt(conn, SOL_SOCKET, SO_PEERCRED, &cred, &cl) < 0 ||
+		    (cred.uid != o->allow_uid && cred.uid != 0)) {
+			logmsg("direct connection for %s refused (uid %u)", o->user,
+			       (unsigned)cred.uid);
+			close(conn);
+			free(o);
+			return NULL;
+		}
+	}
+	if (session_get(o->user, ctl) && send_fd(ctl, conn))
+		logmsg("direct connection of %s handed to the session", o->user);
+	else
+		logmsg("could not hand the direct connection of %s to the session", o->user);
+	close(conn);
+	free(o);
+	return NULL;
+}
+
+static void
+admin_connect(int fd, char *args)
+{
+	struct sockaddr_in addr = { .sin_family = AF_INET };
+	socklen_t len = sizeof addr;
+	struct oneshot *o;
+	char ctl[108];
+	char *user = args, *uid_str = strchr(args, ' ');
+	pthread_t tid;
+	int lfd;
+
+	if (uid_str)
+		*uid_str++ = '\0';
+	if (!valid_username(user)) {
+		admin_reply(fd, "ERR invalid user name\n");
+		return;
+	}
+	/* start the session now, so the client finds it right away */
+	if (!session_get(user, ctl)) {
+		admin_reply(fd, "ERR no session for %s\n", user);
+		return;
+	}
+
+	lfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_port = 0;
+	if (lfd < 0 || bind(lfd, (struct sockaddr *)&addr, sizeof addr) < 0 ||
+	    listen(lfd, 1) < 0 || getsockname(lfd, (struct sockaddr *)&addr, &len) < 0) {
+		if (lfd >= 0)
+			close(lfd);
+		admin_reply(fd, "ERR cannot open a port\n");
+		return;
+	}
+
+	o = calloc(1, sizeof *o);
+	if (!o) {
+		close(lfd);
+		admin_reply(fd, "ERR out of memory\n");
+		return;
+	}
+	snprintf(o->user, sizeof o->user, "%s", user);
+	o->fd = lfd;
+	if (uid_str && *uid_str) {
+		o->allow_uid = (uid_t)strtoul(uid_str, NULL, 10);
+		o->restrict_uid = true;
+	}
+	if (pthread_create(&tid, NULL, oneshot_thread, o) != 0) {
+		close(lfd);
+		free(o);
+		admin_reply(fd, "ERR cannot start the handover\n");
+		return;
+	}
+	pthread_detach(tid);
+	logmsg("direct connection for %s: waiting on 127.0.0.1:%u", user,
+	       (unsigned)ntohs(addr.sin_port));
+	admin_reply(fd, "PORT %u\n", (unsigned)ntohs(addr.sin_port));
+}
+
 static void *
 admin_thread(void *data)
 {
@@ -1359,6 +1475,8 @@ admin_thread(void *data)
 				admin_list(fd);
 			else if (!strncmp(line, "LOGOFF ", 7) && valid_username(line + 7))
 				admin_logoff(fd, line + 7);
+			else if (!strncmp(line, "CONNECT ", 8))
+				admin_connect(fd, line + 8);
 			else
 				admin_reply(fd, "ERR unknown command\n");
 		}
