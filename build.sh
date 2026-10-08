@@ -83,7 +83,9 @@ configure() {
 }
 
 build() {
-	[[ -f "$BUILD_DIR/build.ninja" ]] || configure
+	# immer konfigurieren: sonst greifen neue Optionen aus diesem Skript
+	# nach einem "git pull" nicht, und Module wie kiosk-shell.so fehlen
+	configure
 	ninja -C "$BUILD_DIR" "${NINJA_OPTS[@]}"
 	echo
 	echo "Build fertig:"
