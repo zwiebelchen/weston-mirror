@@ -542,6 +542,7 @@ session_keeper(const struct passwd *pw, const char *ctl, enum session_kind kind,
 	struct pam_conv conv = { pam_conv_cb, &creds };
 	pam_handle_t *pamh = NULL;
 	char rundir[64], logpath[128], certpath[128], keypath[128], lang[64];
+	char ini_path[160] = "", config_opt[200] = "";
 	char **penv = NULL;
 	bool session_open = false, pam_done = false, pam_pending = false;
 	pthread_t pam_thread;
@@ -620,6 +621,26 @@ session_keeper(const struct passwd *pw, const char *ctl, enum session_kind kind,
 	if (kind == SESSION_WEB)
 		snprintf(logpath, sizeof logpath, "%s/weston-rail-web-%s.log", rundir,
 			 app && *app ? app : "sitzung");
+	if (kind == SESSION_WEB && shell && !strcmp(shell, "desktop")) {
+		/* desktop-shell ohne Panel und mit schwarzem Hintergrund: der
+		 * Browser-Tab soll die Anwendung zeigen, keinen Schreibtisch */
+		FILE *f;
+
+		snprintf(ini_path, sizeof ini_path, "%s/weston-rail-web-%s.ini", rundir,
+			 app && *app ? app : "sitzung");
+		f = fopen(ini_path, "we");
+		if (f) {
+			fprintf(f, "[shell]\npanel-position=none\n"
+				   "background-color=0xff000000\n"
+				   "animation=none\nstartup-animation=none\n"
+				   "close-animation=none\nfocus-animation=none\n");
+			fclose(f);
+			if (chown(ini_path, pw->pw_uid, pw->pw_gid) < 0)
+				logmsg("web session for %s: cannot chown the configuration",
+				       pw->pw_name);
+			snprintf(config_opt, sizeof config_opt, "--config=%s", ini_path);
+		}
+	}
 	else
 		snprintf(logpath, sizeof logpath, "%s/weston-rail.log", rundir);
 	read_default_lang(lang, sizeof lang);
@@ -696,6 +717,8 @@ session_keeper(const struct passwd *pw, const char *ctl, enum session_kind kind,
 			snprintf(wayland_socket, sizeof wayland_socket,
 				 "--socket=weston-rail-web-%s", app && *app ? app : "sitzung");
 			argv[argc++] = wayland_socket;
+			if (config_opt[0])
+				argv[argc++] = config_opt;
 		} else {
 			argv[argc++] = "--shell=rdprail-shell.so";
 		}
@@ -729,6 +752,8 @@ session_keeper(const struct passwd *pw, const char *ctl, enum session_kind kind,
 		snprintf(path, sizeof path, "%s/weston-rail-ntlm.sam", rundir);
 		if (kind == SESSION_RAIL)
 			unlink(path);
+		if (ini_path[0])
+			unlink(ini_path);
 	}
 	unlink(certpath);
 	unlink(keypath);
@@ -1470,17 +1495,28 @@ admin_list(int fd)
 }
 
 static void
-admin_logoff(int fd, const char *user)
+admin_logoff(int fd, char *user)
 {
 	struct session *s;
 	pid_t pid = 0;
+	char *app = strstr(user, " app=");
+
+	/* "LOGOFF <user>" beendet die RemoteApp-Sitzung,
+	 * "LOGOFF <user> app=<name>" die Browser-Sitzung dieses Programms */
+	if (app) {
+		*app = '\0';
+		app += 5;
+	}
+	if (!valid_username(user)) {
+		admin_reply(fd, "ERR invalid user name\n");
+		return;
+	}
 
 	pthread_mutex_lock(&lock);
-	s = session_find_locked(user, SESSION_RAIL, NULL);
-	if (!s)
-		for (s = sessions; s; s = s->next)
-			if (!strcmp(s->user, user))
-				break;
+	if (app)
+		s = session_find_locked(user, SESSION_WEB, app);
+	else
+		s = session_find_locked(user, SESSION_RAIL, NULL);
 	if (s)
 		pid = s->pid;
 	pthread_mutex_unlock(&lock);
@@ -1488,7 +1524,7 @@ admin_logoff(int fd, const char *user)
 		admin_reply(fd, "ERR no session for %s\n", user);
 		return;
 	}
-	logmsg("session for %s: logoff requested by the administrator", user);
+	logmsg("session for %s%s%s: logoff requested", user, app ? " " : "", app ? app : "");
 	kill(pid, SIGTERM);	/* the keeper ends weston's process group */
 	admin_reply(fd, "OK\n");
 }
@@ -1562,7 +1598,9 @@ admin_connect(int fd, char *args)
 	struct sockaddr_in addr = { .sin_family = AF_INET };
 	socklen_t len = sizeof addr;
 	struct oneshot *o;
-	char ctl[108], command[2048] = "", shell[16] = "kiosk", app[64] = "";
+	/* desktop: kiosk-shell liefert in dieser Betriebsart keine
+	 * Mausereignisse an die Anwendung */
+	char ctl[108], command[2048] = "", shell[16] = "desktop", app[64] = "";
 	char *user = args, *tok, *save = NULL;
 	enum session_kind kind = SESSION_RAIL;
 	uid_t allow_uid = 0;
@@ -1701,7 +1739,7 @@ admin_thread(void *data)
 			}
 			else if (!strcmp(line, "LIST"))
 				admin_list(fd);
-			else if (!strncmp(line, "LOGOFF ", 7) && valid_username(line + 7))
+			else if (!strncmp(line, "LOGOFF ", 7))
 				admin_logoff(fd, line + 7);
 			else if (!strncmp(line, "CONNECT ", 8))
 				admin_connect(fd, line + 8);
