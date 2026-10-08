@@ -1642,9 +1642,30 @@ admin_thread(void *data)
 		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 		n = read(fd, line, sizeof line - 1);
 		if (n > 0) {
+			char *password;
+
 			line[n] = '\0';
+			/* "AUTH <user>\n<password>\n": check a login for
+			 * weston-rail-web, so PAM stays in one place */
+			password = strchr(line, '\n');
+			if (password)
+				*password++ = '\0';
 			line[strcspn(line, "\r\n")] = '\0';
-			if (!strcmp(line, "LIST"))
+			if (!strncmp(line, "AUTH ", 5)) {
+				char rhost[64] = "";
+				const char *user = line + 5;
+
+				if (password)
+					password[strcspn(password, "\r\n")] = '\0';
+				if (valid_username(user) && password && *password &&
+				    pam_check(user, password, rhost[0] ? rhost : NULL))
+					admin_reply(fd, "OK\n");
+				else
+					admin_reply(fd, "ERR login refused\n");
+				if (password)
+					memset(password, 0, strlen(password));
+			}
+			else if (!strcmp(line, "LIST"))
 				admin_list(fd);
 			else if (!strncmp(line, "LOGOFF ", 7) && valid_username(line + 7))
 				admin_logoff(fd, line + 7);
