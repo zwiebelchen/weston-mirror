@@ -3421,6 +3421,35 @@ sigint_helper(int sig)
 	raise(SIGUSR2);
 }
 
+/*
+ * weston-rail-web: ein Programm in dieser Sitzung starten, sobald der
+ * erste Sitz existiert. Der Sitz entsteht mit der RDP-Verbindung;
+ * Programme, die vorher starten (GTK/Wayland, z. B. Firefox oder gedit),
+ * binden ihn nicht nach und bleiben ohne Tastatur und Maus.
+ */
+struct wet_autolaunch {
+	struct wl_listener seat_created;
+	struct weston_compositor *compositor;
+	const char *command;
+	bool done;
+};
+
+static struct wet_autolaunch autolaunch_state;
+
+static void
+wet_autolaunch_on_seat(struct wl_listener *listener, void *data)
+{
+	struct wet_autolaunch *al =
+		container_of(listener, struct wet_autolaunch, seat_created);
+
+	if (al->done)
+		return;
+	al->done = true;
+	weston_log("autolaunch: %s\n", al->command);
+	if (!weston_client_start_command(al->compositor, al->command))
+		weston_log("autolaunch failed\n");
+}
+
 WL_EXPORT int
 wet_main(int argc, char *argv[])
 {
@@ -3735,18 +3764,17 @@ wet_main(int argc, char *argv[])
 	weston_compositor_sleep(wet.compositor);
 
 	{
-		/*
-		 * weston-rail-web: start one program in this session once
-		 * everything is up. It inherits the environment, above all
-		 * WAYLAND_DISPLAY and DISPLAY (Xwayland), which a program
-		 * started from outside would not have.
-		 */
 		const char *autolaunch = getenv("WESTON_AUTOLAUNCH");
 
 		if (autolaunch && *autolaunch) {
-			weston_log("autolaunch: %s\n", autolaunch);
-			if (!weston_client_start_command(wet.compositor, autolaunch))
-				weston_log("autolaunch failed\n");
+			autolaunch_state.compositor = wet.compositor;
+			autolaunch_state.command = autolaunch;
+			autolaunch_state.seat_created.notify = wet_autolaunch_on_seat;
+			wl_signal_add(&wet.compositor->seat_created_signal,
+				      &autolaunch_state.seat_created);
+			/* falls schon ein Sitz existiert, sofort starten */
+			if (!wl_list_empty(&wet.compositor->seat_list))
+				wet_autolaunch_on_seat(&autolaunch_state.seat_created, NULL);
 		}
 	}
 
